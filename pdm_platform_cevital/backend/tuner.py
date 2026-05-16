@@ -1,0 +1,412 @@
+"""
+tuner.py v3 — Fix visualisation temps réel
+Problème : model.fit() bloquait l'event loop → les messages WS
+           étaient mis en queue et envoyés seulement à la fin.
+Solution : model.fit() s'exécute dans un ThreadPoolExecutor via
+           loop.run_in_executor() → l'event loop reste libre pour
+           traiter les envois WebSocket à chaque époque.
+"""
+import os, time, math, asyncio, concurrent.futures
+import numpy as np
+
+os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
+import tensorflow as tf
+from tensorflow import keras
+from tensorflow.keras.models import Sequential, Model
+from tensorflow.keras.layers import (
+    LSTM, GRU, SimpleRNN, Dense, Dropout, Input,
+    MultiHeadAttention, LayerNormalization, GlobalAveragePooling1D, Add
+)
+from tensorflow.keras.callbacks import EarlyStopping, Callback
+from sklearn.metrics import r2_score, mean_absolute_error
+from sklearn.model_selection import TimeSeriesSplit
+import keras_tuner as kt
+
+
+# ─────────────────────────────────────────────────────────────
+# Callback — s'exécute dans le thread TF
+# Utilise run_coroutine_threadsafe pour envoyer au WS
+# ─────────────────────────────────────────────────────────────
+class WebSocketCallback(Callback):
+    """
+    Envoie les métriques via WebSocket à chaque époque.
+    Fonctionne même quand model.fit() tourne dans un thread séparé.
+    """
+    def __init__(self, loop, send_coro_fn, total_epochs, trial_id=None):
+        super().__init__()
+        self._loop         = loop           # event loop principal
+        self._send_coro_fn = send_coro_fn   # fonction qui renvoie une coroutine
+        self.total_epochs  = total_epochs
+        self.trial_id      = trial_id
+        self._epoch_start  = 0
+
+    def _emit(self, payload):
+        """Envoie depuis le thread TF vers l'event loop principal."""
+        try:
+            coro = self._send_coro_fn(payload)
+            asyncio.run_coroutine_threadsafe(coro, self._loop)
+        except Exception:
+            pass
+
+    def on_epoch_begin(self, epoch, logs=None):
+        self._epoch_start = time.time()
+
+    def on_epoch_end(self, epoch, logs=None):
+        logs    = logs or {}
+        elapsed = round(time.time() - self._epoch_start, 1)
+        self._emit({
+            "type":     "epoch",
+            "epoch":    epoch + 1,
+            "total":    self.total_epochs,
+            "trial":    self.trial_id,
+            "elapsed":  elapsed,
+            "loss":     round(float(logs.get("loss",     0)), 6),
+            "val_loss": round(float(logs.get("val_loss", 0)), 6),
+            "mae":      round(float(logs.get("mae",      0)), 6),
+            "val_mae":  round(float(logs.get("val_mae",  0)), 6),
+        })
+
+
+# ─────────────────────────────────────────────────────────────
+# Construction des modèles
+# ─────────────────────────────────────────────────────────────
+def build_recurrent_model(architecture, n_timesteps, n_features,
+                           num_layers, units, dropout_rates, learning_rate):
+    layer_map = {"LSTM": LSTM, "GRU": GRU, "RNN": SimpleRNN}
+    RNNLayer  = layer_map.get(architecture, LSTM)
+    model = Sequential(name=f"{architecture}_model")
+    model.add(Input(shape=(n_timesteps, n_features)))
+    for i in range(num_layers):
+        model.add(RNNLayer(units=units[i], return_sequences=(i < num_layers - 1)))
+        model.add(Dropout(rate=dropout_rates[i]))
+    model.add(Dense(1, activation="linear"))
+    model.compile(
+        optimizer=keras.optimizers.Adam(learning_rate=learning_rate),
+        loss="mse", metrics=["mae"]
+    )
+    return model
+
+
+def build_transformer_model(n_timesteps, n_features, num_layers,
+                              d_model, num_heads, dropout_rate, learning_rate):
+    inputs = Input(shape=(n_timesteps, n_features))
+    x = Dense(d_model)(inputs)
+    for _ in range(num_layers):
+        attn = MultiHeadAttention(num_heads=num_heads, key_dim=d_model // num_heads)(x, x)
+        attn = Dropout(dropout_rate)(attn)
+        x    = LayerNormalization()(Add()([x, attn]))
+        ff   = Dense(d_model * 2, activation="relu")(x)
+        ff   = Dense(d_model)(ff)
+        ff   = Dropout(dropout_rate)(ff)
+        x    = LayerNormalization()(Add()([x, ff]))
+    x      = GlobalAveragePooling1D()(x)
+    output = Dense(1, activation="linear")(x)
+    model  = Model(inputs=inputs, outputs=output)
+    model.compile(
+        optimizer=keras.optimizers.Adam(learning_rate=learning_rate),
+        loss="mse", metrics=["mae"]
+    )
+    return model
+
+
+# ─────────────────────────────────────────────────────────────
+# Classe principale
+# ─────────────────────────────────────────────────────────────
+class PDMTuner:
+    def __init__(self, X_train, y_train, X_test, y_test,
+                 scaler_y, exports_dir, experiment_name, send_fn=None):
+        self.X_train         = X_train
+        self.y_train         = y_train
+        self.X_test          = X_test
+        self.y_test          = y_test
+        self.scaler_y        = scaler_y
+        self.exports_dir     = exports_dir
+        self.experiment_name = experiment_name
+        self.safe_name       = experiment_name.replace(" ", "_").replace("/", "-")
+        # send_fn est la version ASYNC (coroutine) venant de main.py
+        self._send_fn        = send_fn or (lambda x: None)
+        self.n_timesteps     = X_train.shape[1]
+        self.n_features      = X_train.shape[2]
+        os.makedirs(exports_dir, exist_ok=True)
+
+    async def _send(self, payload: dict):
+        """Envoi async depuis le code principal."""
+        try:
+            await self._send_fn(payload)
+        except Exception:
+            pass
+
+    # ─────────────────────────────────────────────────────────
+    # Exécute model.fit dans un thread → libère l'event loop
+    # ─────────────────────────────────────────────────────────
+    async def _fit_in_thread(self, model, X, y, epochs, batch_size,
+                              val_data, callbacks):
+        """
+        Lance model.fit dans un ThreadPoolExecutor.
+        L'event loop asyncio reste libre → les messages WebSocket
+        partent à chaque époque sans attendre la fin.
+        """
+        loop = asyncio.get_event_loop()
+
+        def _blocking_fit():
+            return model.fit(
+                X, y,
+                epochs=epochs,
+                batch_size=batch_size,
+                validation_data=val_data,
+                callbacks=callbacks,
+                verbose=0,
+            )
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+            history = await loop.run_in_executor(executor, _blocking_fit)
+        return history
+
+    # ─────────────────────────────────────────────────────────
+    # MODE MANUEL
+    # ─────────────────────────────────────────────────────────
+    async def train_manual(self, architecture, num_layers, units,
+                            dropout_rates, learning_rate, epochs,
+                            batch_size, patience=10):
+        await self._send({"type": "log",
+                          "message": f"Entrainement {architecture} (Mode Manuel)"})
+        start = time.time()
+
+        if architecture == "Transformer":
+            model = build_transformer_model(
+                self.n_timesteps, self.n_features, num_layers,
+                units[0], 4, dropout_rates[0], learning_rate
+            )
+        else:
+            model = build_recurrent_model(
+                architecture, self.n_timesteps, self.n_features,
+                num_layers, units, dropout_rates, learning_rate
+            )
+
+        await self._send({"type": "log",
+                          "message": f"   Parametres : {model.count_params():,}"})
+
+        # Récupérer l'event loop pour le callback
+        loop   = asyncio.get_event_loop()
+        cb_ws  = WebSocketCallback(loop, self._send_fn, epochs)
+        cb_es  = EarlyStopping(monitor="val_loss", patience=patience,
+                               restore_best_weights=True)
+
+        # model.fit dans un thread → event loop libre pour les WS
+        history = await self._fit_in_thread(
+            model, self.X_train, self.y_train, epochs, batch_size,
+            val_data=(self.X_test, self.y_test),
+            callbacks=[cb_ws, cb_es],
+        )
+
+        result = await self._evaluate_and_save(model, history, start)
+        result["hyperparameters"] = {
+            "architecture":  architecture,
+            "num_layers":    num_layers,
+            "units":         units,
+            "dropout":       dropout_rates,
+            "learning_rate": learning_rate,
+            "epochs":        epochs,
+            "batch_size":    batch_size,
+        }
+        return result
+
+    # ─────────────────────────────────────────────────────────
+    # MODE AUTOMATIQUE — Bayesian + TimeSeriesSplit
+    # ─────────────────────────────────────────────────────────
+    async def train_auto(self, architecture,
+                          layers_min=1, layers_max=4,
+                          units_min=32, units_max=256, units_step=32,
+                          dropout_min=0.1, dropout_max=0.5,
+                          lr_choices=None, max_trials=10, cv_folds=5,
+                          epochs_per_trial=20, final_epochs=50, batch_size=32):
+
+        if lr_choices is None:
+            lr_choices = [1e-2, 1e-3, 1e-4]
+
+        await self._send({"type": "log",
+                          "message": f"AutoML {architecture} | {max_trials} essais | {cv_folds} plis CV"})
+        start  = time.time()
+        loop   = asyncio.get_event_loop()
+        n_ts, n_ft = self.n_timesteps, self.n_features
+
+        def build_model(hp):
+            nl    = hp.Int("num_layers", layers_min, layers_max)
+            units = [hp.Int(f"units_{i}", units_min, units_max, step=units_step) for i in range(nl)]
+            drops = [hp.Float(f"dropout_{i}", dropout_min, dropout_max, step=0.1) for i in range(nl)]
+            lr    = hp.Choice("lr", lr_choices)
+            if architecture == "Transformer":
+                return build_transformer_model(
+                    n_ts, n_ft, nl, units[0],
+                    hp.Choice("num_heads", [2, 4, 8]), drops[0], lr
+                )
+            return build_recurrent_model(architecture, n_ts, n_ft, nl, units, drops, lr)
+
+        tuner_dir = os.path.join(self.exports_dir, "tuning", self.safe_name)
+        tuner = kt.BayesianOptimization(
+            build_model, objective="val_loss", max_trials=max_trials,
+            directory=tuner_dir,
+            project_name=f"{self.safe_name}_{architecture.lower()}",
+            overwrite=True,
+        )
+
+        tscv   = TimeSeriesSplit(n_splits=cv_folds)
+        X_full = np.concatenate([self.X_train, self.X_test], axis=0)
+        y_full = np.concatenate([self.y_train, self.y_test], axis=0)
+        trial_results = []
+
+        for trial_num in range(max_trials):
+            await self._send({
+                "type":    "trial_start",
+                "trial":   trial_num + 1,
+                "total":   max_trials,
+                "message": f"Essai {trial_num+1}/{max_trials} en cours...",
+            })
+            t_start   = time.time()
+            cv_scores = []
+
+            for fold, (tr_idx, val_idx) in enumerate(tscv.split(X_full)):
+                await self._send({"type": "log",
+                                  "message": f"   Pli {fold+1}/{cv_folds}"})
+                try:
+                    hp_obj = kt.HyperParameters()
+                    _model = build_model(hp_obj)
+                    _es    = EarlyStopping(monitor="val_loss", patience=5,
+                                           restore_best_weights=True)
+                    _hist  = await self._fit_in_thread(
+                        _model, X_full[tr_idx], y_full[tr_idx],
+                        epochs_per_trial, batch_size,
+                        val_data=(X_full[val_idx], y_full[val_idx]),
+                        callbacks=[_es],
+                    )
+                    cv_scores.append(min(_hist.history.get("val_loss", [999])))
+                    del _model
+                except Exception:
+                    pass
+
+            avg_cv = float(np.mean(cv_scores)) if cv_scores else 999.0
+            dur    = round(time.time() - t_start, 1)
+            trial_results.append({
+                "trial": trial_num + 1,
+                "avg_cv_loss": round(avg_cv, 6),
+                "duration_sec": dur,
+            })
+            await self._send({
+                "type":        "trial_end",
+                "trial":       trial_num + 1,
+                "total":       max_trials,
+                "avg_cv_loss": round(avg_cv, 6),
+                "duration":    dur,
+                "message":     f"   Essai {trial_num+1}/{max_trials} — CV Loss: {avg_cv:.4f}",
+            })
+
+        await self._send({"type": "log",
+                          "message": "Recherche Keras Tuner (entraînement final)..."})
+
+        # Keras Tuner search dans un thread
+        def _tuner_search():
+            tuner.search(
+                self.X_train, self.y_train,
+                epochs=epochs_per_trial, validation_split=0.2,
+                callbacks=[EarlyStopping("val_loss", patience=5)],
+                verbose=0,
+            )
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+            await loop.run_in_executor(executor, _tuner_search)
+
+        best_model = tuner.get_best_models(num_models=1)[0]
+        best_hps   = tuner.get_best_hyperparameters(num_trials=1)[0]
+
+        await self._send({"type": "log",
+                          "message": "Entraînement final du meilleur modèle..."})
+
+        cb_ws   = WebSocketCallback(loop, self._send_fn, final_epochs)
+        cb_es   = EarlyStopping("val_loss", patience=10, restore_best_weights=True)
+        history = await self._fit_in_thread(
+            best_model, self.X_train, self.y_train,
+            final_epochs, batch_size,
+            val_data=(self.X_test, self.y_test),
+            callbacks=[cb_ws, cb_es],
+        )
+
+        result = await self._evaluate_and_save(best_model, history, start)
+        n_l    = best_hps.get("num_layers")
+        result["hyperparameters"] = {
+            "architecture":  architecture,
+            "num_layers":    n_l,
+            "units":         [best_hps.get(f"units_{i}") for i in range(n_l)],
+            "dropout":       [best_hps.get(f"dropout_{i}") for i in range(n_l)],
+            "learning_rate": best_hps.get("lr"),
+            "epochs":        final_epochs,
+            "batch_size":    batch_size,
+        }
+        result["total_trials"]  = max_trials
+        result["cv_folds"]      = cv_folds
+        result["trial_results"] = trial_results
+        return result
+
+    # ─────────────────────────────────────────────────────────
+    # Évaluation + sauvegarde
+    # ─────────────────────────────────────────────────────────
+    async def _evaluate_and_save(self, model, history, start_time):
+        # Prédictions (espace normalisé)
+        y_pred_s  = model.predict(self.X_test, verbose=0)
+
+        # Dénormalisation → valeurs en HEURES réelles
+        y_pred_h  = self.scaler_y.inverse_transform(y_pred_s.reshape(-1,1)).flatten()
+        y_true_h  = self.scaler_y.inverse_transform(self.y_test.reshape(-1,1)).flatten()
+
+        # ── MÉTRIQUES PRINCIPALES : calculées sur valeurs DÉNORMALISÉES (heures) ──
+        # Bien plus interprétable pour le prof et l'utilisateur
+        r2        = float(r2_score(y_true_h, y_pred_h))
+        mae_hours = float(mean_absolute_error(y_true_h, y_pred_h))
+        rmse_hours = float(np.sqrt(np.mean((y_true_h - y_pred_h) ** 2)))
+
+        # MAE normalisée gardée pour info (valeurs entre 0 et 1)
+        mae_norm  = float(mean_absolute_error(self.y_test.flatten(), y_pred_s.flatten()))
+
+        duration  = time.time() - start_time
+
+        # Format .keras (plus .h5 déprécié)
+        model_path = os.path.join(self.exports_dir, f"model_{self.safe_name}.keras")
+        model.save(model_path)
+
+        training_history = {
+            k: [round(float(v), 6) for v in vals]
+            for k, vals in history.history.items()
+        }
+
+        # Données prédiction pour le frontend
+        n = min(200, len(y_true_h))
+        predictions_data = {
+            "y_true":     [round(float(v), 2) for v in y_true_h[:n]],
+            "y_pred":     [round(float(v), 2) for v in y_pred_h[:n]],
+            "errors":     [round(float(abs(y_pred_h[i] - y_true_h[i])), 2) for i in range(n)],
+            "mae_hours":  round(mae_hours, 2),
+            "rmse_hours": round(rmse_hours, 2),
+            "r2_score":   round(r2, 4),
+        }
+
+        await self._send({
+            "type":       "result",
+            "r2":         round(r2, 4),
+            "mae":        round(mae_norm, 4),
+            "rmse":       round(rmse_hours, 4),
+            "mae_hours":  round(mae_hours, 2),
+            "rmse_hours": round(rmse_hours, 2),
+            "duration":   round(duration, 1),
+            "message":    f"\nR²={r2:.4f} | MAE={mae_hours:.2f}h | RMSE={rmse_hours:.2f}h | Durée={duration:.1f}s",
+        })
+
+        return {
+            "r2_score":         r2,
+            "mae":              mae_norm,
+            "rmse":             rmse_hours,
+            "mae_hours":        mae_hours,
+            "rmse_hours":       rmse_hours,
+            "model_path":       model_path,
+            "training_history": training_history,
+            "duration_sec":     duration,
+            "predictions_data": predictions_data,
+        }
