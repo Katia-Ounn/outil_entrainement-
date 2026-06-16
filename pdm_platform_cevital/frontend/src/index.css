@@ -11,6 +11,11 @@
    - Bascule via data-theme="light" sur <html> (gérée dans AppContext)
    ═══════════════════════════════════════════════════════════════ */
 
+/* ─── Color-scheme : indique au navigateur quel thème natif utiliser
+        pour scrollbars, form controls, autofill, etc.                  */
+:root[data-theme="dark"]  { color-scheme: dark;  }
+:root[data-theme="light"] { color-scheme: light; }
+
 /* ─── Dark theme (défaut) ─────────────────────────────────────── */
 :root,
 :root[data-theme="dark"] {

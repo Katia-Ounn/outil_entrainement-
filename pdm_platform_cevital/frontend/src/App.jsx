@@ -11,8 +11,9 @@
  *
  * Routes du backend en Phase 0 : démos OK, datasets/training renvoient 501.
  */
-import { useState } from 'react';
+import { useState, useEffect } from 'react';
 import { BrainCircuit, Trophy, BookOpen, Sliders, Moon, Sun, Factory } from 'lucide-react';
+import { Toaster } from 'react-hot-toast';
 import { AppProvider, useApp }   from './AppContext';
 import TrainingPanel    from './components/TrainingPanel';
 import Leaderboard      from './components/Leaderboard';
@@ -21,19 +22,35 @@ import PreparationPanel from './components/PreparationPanel';
 import CevitalLogo      from './components/CevitalLogo';
 
 const TABS = [
-  { id: 'prep',   label: 'Préparation Données', icon: Sliders,      colorVar: '--accent-purple',
-    subtitle: 'Cevital · EDA + Features + Prétraitement' },
-  { id: 'train',  label: 'Entraînement',        icon: BrainCircuit, colorVar: '--accent-green',
-    subtitle: 'Cevital · LSTM/GRU avec embedding composant' },
-  { id: 'demo',   label: 'Démo',                icon: BookOpen,     colorVar: '--accent-purple',
-    subtitle: 'Pédagogique · Architectures neuronales' },
-  { id: 'leader', label: 'Leaderboard',         icon: Trophy,       colorVar: '--accent-orange',
-    subtitle: 'Cevital · Modèles entraînés' },
+  { id: 'prep',   label: 'Data Preparation',   icon: Sliders,      colorVar: '--accent-purple',
+    subtitle: 'Cevital · EDA + Features + Preprocessing' },
+  { id: 'train',  label: 'Training',           icon: BrainCircuit, colorVar: '--accent-green',
+    subtitle: 'Cevital · LSTM/GRU with component embedding' },
+  { id: 'demo',   label: 'Demo',               icon: BookOpen,     colorVar: '--accent-purple',
+    subtitle: 'Pedagogical · Neural Architectures' },
+  { id: 'leader', label: 'Leaderboard',        icon: Trophy,       colorVar: '--accent-orange',
+    subtitle: 'Cevital · Trained Models' },
 ];
 
 function AppInner() {
   const [activeTab, setActiveTab] = useState('prep');
-  const { theme, toggleTheme } = useApp();
+  const {
+    theme, toggleTheme, pendingRetrain,
+    requestedTab, consumeRequestedTab,
+  } = useApp();
+
+  // 🔄 Quand le Leaderboard pousse un retrain → basculer sur l'onglet Entraînement
+  useEffect(() => {
+    if (pendingRetrain) setActiveTab('train');
+  }, [pendingRetrain]);
+
+  // 🧭 Navigation programmatique demandée par un composant
+  useEffect(() => {
+    if (requestedTab) {
+      setActiveTab(requestedTab);
+      consumeRequestedTab();
+    }
+  }, [requestedTab, consumeRequestedTab]);
 
   const activeMeta = TABS.find(t => t.id === activeTab);
 
@@ -54,10 +71,10 @@ function AppInner() {
             <div>
               <h1 className="font-bold text-base leading-tight"
                   style={{ color: 'var(--text-primary)' }}>
-                CEVITAL · PdM Platform
+                Time Series ML Training Platform
               </h1>
               <p className="text-xs" style={{ color: 'var(--text-muted)' }}>
-                Maintenance Prédictive · GMAO · PFE Master 2
+                Predictive Maintenance
               </p>
             </div>
           </div>
@@ -70,7 +87,7 @@ function AppInner() {
               color: 'var(--brand-primary)',
             }}>
             <Factory size={12} />
-            PdM Cevital · Maintenance Prédictive GMAO
+            ML Experimentation Platform · Cevital
           </div>
 
           {/* Navigation + toggle thème */}
@@ -175,6 +192,28 @@ export default function App() {
   return (
     <AppProvider>
       <AppInner />
+      <Toaster
+        position="bottom-right"
+        toastOptions={{
+          duration: 3500,
+          style: {
+            background:    'var(--bg-elevated)',
+            color:         'var(--text-primary)',
+            border:        '1px solid var(--border-strong)',
+            borderRadius:  '10px',
+            fontSize:      '13px',
+            fontFamily:    "'Space Grotesk', sans-serif",
+          },
+          success: {
+            iconTheme: { primary: 'var(--success)', secondary: 'var(--bg-elevated)' },
+            style:     { borderColor: 'var(--success)' },
+          },
+          error: {
+            iconTheme: { primary: 'var(--error)',   secondary: 'var(--bg-elevated)' },
+            style:     { borderColor: 'var(--error)' },
+          },
+        }}
+      />
     </AppProvider>
   );
 }

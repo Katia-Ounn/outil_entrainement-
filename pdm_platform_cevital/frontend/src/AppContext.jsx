@@ -2,7 +2,10 @@
  * AppContext.jsx — État global partagé entre tous les panels
  * Persist dans localStorage pour survivre aux refreshs
  */
-import { createContext, useContext, useState, useEffect, useCallback, useRef } from 'react';
+import {
+  createContext, useContext, useState, useEffect,
+  useCallback, useRef, useLayoutEffect,
+} from 'react';
 
 const AppContext = createContext(null);
 
@@ -12,24 +15,129 @@ const load = (key, def)  => { try { const v = localStorage.getItem(key); return 
 
 export function AppProvider({ children }) {
 
-  // ── 🎨 Theme switcher (Phase 0) ───────────────────────────
+  // ── 🎨 Theme switcher ───────────────────────────────────────
   // 'dark' (défaut) | 'light'. Persisté dans localStorage, appliqué via
-  // data-theme="..." sur <html> pour activer les variables CSS du index.css.
-  const [theme, setTheme] = useState(() => load('cevital_theme', 'dark'));
+  // data-theme="..." sur <html> (CSS variables index.css).
+  //
+  // 🐛 Fix Phase 6 : on lit la valeur synchrone (lazy init), on l'applique
+  // direct dans useLayoutEffect (avant le paint, pas useEffect = après).
+  // index.html a déjà posé le bon data-theme avant React → useEffect ne
+  // FAIT que synchroniser localStorage et mettre à jour data-theme sur
+  // changement, sans flash.
+  const [theme, setTheme] = useState(() => {
+    const t = load('cevital_theme', 'dark');
+    return t === 'light' ? 'light' : 'dark';
+  });
+
+  useLayoutEffect(() => {
+    document.documentElement.setAttribute(
+      'data-theme', theme === 'light' ? 'light' : 'dark'
+    );
+  }, [theme]);
 
   useEffect(() => {
-    const root = document.documentElement;
-    if (theme === 'light') {
-      root.setAttribute('data-theme', 'light');
-    } else {
-      root.setAttribute('data-theme', 'dark');
-    }
     save('cevital_theme', theme);
   }, [theme]);
 
   const toggleTheme = useCallback(() => {
     setTheme(prev => (prev === 'dark' ? 'light' : 'dark'));
   }, []);
+
+  // ── 🔄 Re-train flow (Phase 4) ──────────────────────────────
+  const [pendingRetrain, setPendingRetrain] = useState(null);
+  const requestRetrain = useCallback((payload) => {
+    setPendingRetrain(payload || null);
+  }, []);
+  const consumeRetrain = useCallback(() => {
+    setPendingRetrain(null);
+  }, []);
+
+  // ── 🧭 Navigation programmatique entre onglets ──────────────
+  // Tout composant peut faire `goToTab('prep')` pour basculer
+  // l'utilisateur sur un autre onglet (lien "Modifier dans Prétraitement").
+  const [requestedTab, setRequestedTab] = useState(null);
+  const goToTab = useCallback((tabId) => setRequestedTab(tabId), []);
+  const consumeRequestedTab = useCallback(() => setRequestedTab(null), []);
+
+  // ── 📊 Préparation Données (Phase 2) ────────────────────────
+  // Dataset Cevital actif + résultats cachés des 5 sous-onglets (RawEDA,
+  // FeatureEngineering, FeaturesEDA, Preprocessing, MergeDatasets).
+  // Le user peut changer de sous-onglet sans perdre les résultats.
+  const [currentDatasetId, setCurrentDatasetId] = useState(() => load('cev_dataset_id', null));
+  const [prepStepCompleted, setPrepStepCompleted] = useState(() => load('cev_prep_done', []));
+  const [edaRawResult,      setEdaRawResult]      = useState(() => load('cev_eda_raw', null));
+  const [featuresResult,    setFeaturesResult]    = useState(() => load('cev_features', null));
+  const [edaFeatResult,     setEdaFeatResult]     = useState(() => load('cev_eda_feat', null));
+  const [preprocResult,     setPreprocResult]     = useState(() => load('cev_preproc', null));
+
+  // 🆕 Compteur de version BDD datasets — incrémenté après chaque mutation
+  // (features_stream OK, preprocessing_stream OK, merge, upload, delete).
+  // Les composants qui ont leur propre `datasets` local s'en servent comme
+  // dépendance d'useEffect → re-fetch automatique → status à jour.
+  const [datasetVersion, setDatasetVersion] = useState(0);
+  const bumpDatasetVersion = useCallback(
+    () => setDatasetVersion(v => v + 1),
+    []
+  );
+
+  // 🆕 Features sélectionnées pour le modèle (Lot C — user toggle)
+  // Default = les 9 features du notebook PFE_CHAMPION
+  const DEFAULT_FEATURES = [
+    'comp_level',
+    'pannes_7j', 'pannes_30j', 'pannes_90j',
+    'maint_7j',  'maint_30j',  'maint_90j',
+    'DSLF',      'DSLM',
+  ];
+  const [selectedFeatures, setSelectedFeatures] = useState(
+    () => load('cev_selected_features', DEFAULT_FEATURES)
+  );
+
+  useEffect(() => { save('cev_dataset_id',  currentDatasetId);  }, [currentDatasetId]);
+  useEffect(() => { save('cev_prep_done',   prepStepCompleted); }, [prepStepCompleted]);
+  useEffect(() => { save('cev_eda_raw',     edaRawResult);      }, [edaRawResult]);
+  useEffect(() => { save('cev_features',    featuresResult);    }, [featuresResult]);
+  useEffect(() => { save('cev_eda_feat',    edaFeatResult);     }, [edaFeatResult]);
+  useEffect(() => { save('cev_preproc',     preprocResult);     }, [preprocResult]);
+  useEffect(() => { save('cev_selected_features', selectedFeatures); }, [selectedFeatures]);
+
+  const markPrepStep = useCallback((stepId) => {
+    setPrepStepCompleted(prev => prev.includes(stepId) ? prev : [...prev, stepId]);
+  }, []);
+
+  const resetPrep = useCallback(() => {
+    setCurrentDatasetId(null);
+    setPrepStepCompleted([]);
+    setEdaRawResult(null);
+    setFeaturesResult(null);
+    setEdaFeatResult(null);
+    setPreprocResult(null);
+    ['cev_dataset_id','cev_prep_done','cev_eda_raw','cev_features','cev_eda_feat','cev_preproc']
+      .forEach(k => localStorage.removeItem(k));
+  }, []);
+
+  // Reset pipeline sans changer de dataset (après mise à jour données)
+  const resetPipelineResults = useCallback(() => {
+    setPrepStepCompleted([]);
+    setEdaRawResult(null);
+    setFeaturesResult(null);
+    setEdaFeatResult(null);
+    setPreprocResult(null);
+    ['cev_prep_done','cev_eda_raw','cev_features','cev_eda_feat','cev_preproc']
+      .forEach(k => localStorage.removeItem(k));
+  }, []);
+
+  // Quand on change de dataset, on reset les caches d'étapes (résultats
+  // précédents = ceux de l'ancien dataset, donc non valides).
+  const selectDataset = useCallback((newId) => {
+    if (newId !== currentDatasetId) {
+      setEdaRawResult(null);
+      setFeaturesResult(null);
+      setEdaFeatResult(null);
+      setPreprocResult(null);
+      setPrepStepCompleted([]);
+    }
+    setCurrentDatasetId(newId);
+  }, [currentDatasetId]);
 
   // ── Ingestion ──────────────────────────────────────────────
   const [ingestionStatus,   setIngestionStatus]   = useState(() => load('pdm_ingestion_status', 'idle'));
@@ -180,6 +288,22 @@ export function AppProvider({ children }) {
     <AppContext.Provider value={{
       // 🎨 Theme
       theme, setTheme, toggleTheme,
+
+      // 🔄 Re-train (Phase 4)
+      pendingRetrain, requestRetrain, consumeRetrain,
+
+      // 🧭 Navigation programmatique
+      requestedTab, goToTab, consumeRequestedTab,
+
+      // 📊 Préparation Données
+      currentDatasetId,  setCurrentDatasetId, selectDataset,
+      prepStepCompleted, setPrepStepCompleted, markPrepStep, resetPrep, resetPipelineResults,
+      edaRawResult,      setEdaRawResult,
+      featuresResult,    setFeaturesResult,
+      edaFeatResult,     setEdaFeatResult,
+      preprocResult,     setPreprocResult,
+      selectedFeatures,  setSelectedFeatures, DEFAULT_FEATURES,
+      datasetVersion,    bumpDatasetVersion,
 
       // Ingestion
       ingestionStatus, setIngestionStatus,

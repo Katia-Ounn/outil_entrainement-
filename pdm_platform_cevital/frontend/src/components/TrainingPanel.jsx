@@ -1,19 +1,43 @@
 /**
- * TrainingPanel.jsx — Entraînement avec visualisation temps réel complète
- * Barre Keras style · Graphes live · Résultats dénormalisés détaillés
+ * TrainingPanel.jsx — Entraînement Cevital avec visualisation temps réel.
+ *
+ * Phase 3 (enrichi, PAS refonte) :
+ *  ✅ Card 📦 DATASET en haut (sélecteur + récap preprocessing)
+ *  ✅ Card ⚙️ PARAMÈTRES MODÈLE (embedding_dim 4/8/16/32)
+ *  ✅ Architectures : LSTM/GRU enabled, RNN/Transformer grisés (🔒)
+ *  ✅ Fenêtre temporelle en JOURS (presets 7/14/30/60/90)
+ *  ✅ Champ Machine ID retiré
+ *  ✅ ArchitectureVisualizer : 2 inputs (X_num + X_comp via Embedding)
+ *  ✅ MAE en JOURS (pas heures)
+ *  ✅ Payload API : dataset_id + embedding_dim
  */
 import { useState, useRef, useCallback, useEffect, useMemo } from 'react';
-import { BrainCircuit, Play, Loader, CheckCircle, RefreshCw, Info, Eye } from 'lucide-react';
+import {
+  BrainCircuit, Play, Loader, CheckCircle, RefreshCw, Info, Eye,
+  Database, Cpu, Lock, AlertTriangle,
+} from 'lucide-react';
 import { motion } from 'framer-motion';
 import {
   LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip,
   ResponsiveContainer, Legend, ScatterChart, Scatter,
   BarChart, Bar, Cell, ReferenceLine
 } from 'recharts';
+import { useApp } from '../AppContext';
+import ArchitectureVisualizer from './ArchitectureVisualizer';
 
 const API    = 'http://localhost:8000';
 const WS_URL = 'ws://localhost:8000/ws';
-const ARCH_COLORS = { LSTM:'var(--accent-blue)', GRU:'var(--accent-green)', RNN:'var(--accent-orange)', Transformer:'var(--accent-purple)' };
+
+// Architectures supportées (Cevital = LSTM/GRU). RNN/Transformer désactivés
+// (pas dans le notebook Cevital ; on les garde pour la pédagogie côté Démo).
+const ARCH_DEF = [
+  { id:'LSTM',        color:'var(--accent-blue)',   enabled: true  },
+  { id:'GRU',         color:'var(--accent-green)',  enabled: true  },
+  { id:'RNN',         color:'var(--accent-orange)', enabled: false },
+  { id:'Transformer', color:'var(--accent-purple)', enabled: false },
+];
+const ARCH_COLORS = Object.fromEntries(ARCH_DEF.map(a => [a.id, a.color]));
+const EMBEDDING_OPTIONS = [4, 8, 16, 32];
 
 // ── Boîte info ───────────────────────────────────────────────
 function InfoBox({ text, color='var(--accent-blue)' }) {
@@ -230,36 +254,42 @@ function TrialsView({ trials, maxTrials }) {
 }
 
 // ── Résultats finaux & prédictions ───────────────────────────
+// Cevital : tout en JOURS (data.mae / data.rmse / data.errors). Backward-compat
+// avec l'ancien format Azure (mae_hours/rmse_hours) au cas où.
 function PredictionsView({ data, hyperparams }) {
   if (!data) return null;
-  const { y_true, y_pred, errors, r2_score, mae_hours, rmse_hours } = data;
-  const maxVal = Math.max(...y_true, ...y_pred, 1);
+  const { y_true, y_pred, errors } = data;
+  const r2   = data.r2 ?? data.r2_score;
+  const mae  = data.mae ?? data.mae_hours;
+  const rmse = data.rmse ?? data.rmse_hours;
   const scatter = y_true.map((v,i) => ({ real:v, pred:y_pred[i], err:errors[i] }));
 
-  // Bins erreurs
+  // Bins erreurs (en JOURS)
   const errBins = [
-    { range:'0–5h',   count: errors.filter(e=>e<=5).length,           color:'var(--success)' },
-    { range:'5–10h',  count: errors.filter(e=>e>5&&e<=10).length,     color:'var(--accent-green)' },
-    { range:'10–20h', count: errors.filter(e=>e>10&&e<=20).length,    color:'var(--accent-orange)' },
-    { range:'20–50h', count: errors.filter(e=>e>20&&e<=50).length,    color:'#f06292' },
-    { range:'>50h',   count: errors.filter(e=>e>50).length,           color:'var(--error)' },
+    { range:'0–2 j',    count: errors.filter(e=>e<=2).length,            color:'var(--success)' },
+    { range:'2–5 j',    count: errors.filter(e=>e>2&&e<=5).length,       color:'var(--accent-green)' },
+    { range:'5–10 j',   count: errors.filter(e=>e>5&&e<=10).length,      color:'var(--accent-orange)' },
+    { range:'10–30 j',  count: errors.filter(e=>e>10&&e<=30).length,     color:'var(--accent-pink)' },
+    { range:'>30 j',    count: errors.filter(e=>e>30).length,            color:'var(--error)' },
   ];
 
   return (
     <div className="space-y-5">
       <InfoBox
-        text="Résultats sur le jeu de test (20% chronologique — données jamais vues pendant l'entraînement). Les valeurs sont dénormalisées : reconverties en heures réelles via inverse_transform du scaler_y."
+        text="Résultats sur le jeu de test (split temporel par date — données jamais vues pendant l'entraînement ni la validation). Les valeurs sont dénormalisées et clippées dans [0, current_max_rul] via predict_with_safety()."
         color="var(--success)"
       />
 
-      {/* Métriques globales */}
+      {/* Métriques globales — en JOURS */}
       <div>
-        <p className="text-xs font-semibold mb-2" style={{ color:'var(--text-tertiary)' }}>Métriques finales (dénormalisées)</p>
+        <p className="text-xs font-semibold mb-2" style={{ color:'var(--text-tertiary)' }}>
+          Métriques finales (jours)
+        </p>
         <div className="grid grid-cols-4 gap-3">
-          <Stat label="R² Score"    value={r2_score?.toFixed(4)}          color="var(--success)"  sub="Plus proche de 1 = meilleur" />
-          <Stat label="MAE (heures)"value={`${mae_hours?.toFixed(1)}h`}   color="var(--accent-blue)"  sub="Erreur absolue moyenne" />
-          <Stat label="RMSE (h)"    value={rmse_hours ? `${rmse_hours?.toFixed(1)}h` : '—'} color="var(--accent-orange)" sub="Sensible aux grands écarts" />
-          <Stat label="Échantillons"value={y_true.length}                  color="var(--accent-purple)"  sub="Points de test" />
+          <Stat label="R² Score"     value={r2?.toFixed(4) ?? '—'}                        color="var(--success)"        sub="Plus proche de 1 = meilleur" />
+          <Stat label="MAE (j)"      value={mae  != null ? `${mae.toFixed(2)} j`  : '—'}  color="var(--accent-blue)"    sub="Mean Abs. Error en jours" />
+          <Stat label="RMSE (j)"     value={rmse != null ? `${rmse.toFixed(2)} j` : '—'}  color="var(--accent-orange)"  sub="Sensible aux grands écarts" />
+          <Stat label="Échantillons" value={y_true.length}                                color="var(--accent-purple)"  sub="Points de test" />
         </div>
       </div>
 
@@ -281,19 +311,19 @@ function PredictionsView({ data, hyperparams }) {
 
       {/* Scatter : prédit vs réel */}
       <div>
-        <p className="text-xs font-semibold mb-1" style={{ color:'var(--text-tertiary)' }}>RUL Prédit vs RUL Réel (heures)</p>
+        <p className="text-xs font-semibold mb-1" style={{ color:'var(--text-tertiary)' }}>RUL Prédit vs RUL Réel (jours)</p>
         <InfoBox text="Chaque point = un sample du jeu de test. La ligne verte diagonale = prédiction parfaite. Plus les points s'en rapprochent, meilleur est le modèle." color="var(--success)" />
         <div className="mt-2">
           <ResponsiveContainer width="100%" height={240}>
             <ScatterChart margin={{ top:10, right:10, bottom:30, left:0 }}>
               <CartesianGrid strokeDasharray="3 3" stroke="var(--border-default)" />
               <XAxis type="number" dataKey="real" name="Réel" tick={{ fill:'var(--text-tertiary)', fontSize:9 }}
-                label={{ value:'RUL Réel (heures)', position:'insideBottom', offset:-15, fill:'var(--text-muted)', fontSize:10 }} />
+                label={{ value:'RUL Réel (jours)', position:'insideBottom', offset:-15, fill:'var(--text-muted)', fontSize:10 }} />
               <YAxis type="number" dataKey="pred" name="Prédit" tick={{ fill:'var(--text-tertiary)', fontSize:9 }} width={55}
-                label={{ value:'RUL Prédit (h)', angle:-90, position:'insideLeft', fill:'var(--text-muted)', fontSize:10 }} />
+                label={{ value:'RUL Prédit (j)', angle:-90, position:'insideLeft', fill:'var(--text-muted)', fontSize:10 }} />
               <Tooltip cursor={{ strokeDasharray:'3 3' }}
                 contentStyle={{ background:'var(--bg-elevated)', border:'1px solid var(--border-strong)', borderRadius:8, fontSize:11 }}
-                formatter={(v,n) => [`${v?.toFixed(1)}h`, n]} />
+                formatter={(v,n) => [`${v?.toFixed(1)} j`, n]} />
               <ReferenceLine segment={[{x:0,y:0},{x:maxVal,y:maxVal}]} stroke="var(--success)" strokeWidth={1.5} strokeDasharray="4 2" label={{ value:'Parfait', fill:'var(--success)', fontSize:9 }} />
               <Scatter data={scatter.slice(0,300)} fill="var(--accent-blue)" fillOpacity={0.45} />
             </ScatterChart>
@@ -313,9 +343,9 @@ function PredictionsView({ data, hyperparams }) {
               margin={{ top:5, right:10, bottom:5, left:0 }}>
               <CartesianGrid strokeDasharray="3 3" stroke="var(--border-default)" />
               <XAxis dataKey="i" tick={{ fill:'var(--text-tertiary)', fontSize:9 }} axisLine={{ stroke:'var(--border-default)' }} />
-              <YAxis tick={{ fill:'var(--text-tertiary)', fontSize:9 }} axisLine={{ stroke:'var(--border-default)' }} width={55} tickFormatter={v=>`${Math.round(v)}h`} />
+              <YAxis tick={{ fill:'var(--text-tertiary)', fontSize:9 }} axisLine={{ stroke:'var(--border-default)' }} width={55} tickFormatter={v=>`${Math.round(v)}j`} />
               <Tooltip contentStyle={{ background:'var(--bg-elevated)', border:'1px solid var(--border-strong)', borderRadius:8 }}
-                formatter={(v) => [`${v?.toFixed(1)}h`]} labelFormatter={l=>`Sample #${l}`} />
+                formatter={(v) => [`${v?.toFixed(1)} j`]} labelFormatter={l=>`Sample #${l}`} />
               <Legend wrapperStyle={{ fontSize:11 }} />
               <Line type="monotone" dataKey="real" stroke="var(--success)" dot={false} strokeWidth={2} name="RUL Réel" />
               <Line type="monotone" dataKey="pred" stroke="var(--accent-blue)" dot={false} strokeWidth={2} name="RUL Prédit" strokeDasharray="5 3" />
@@ -367,7 +397,7 @@ function PredictionsView({ data, hyperparams }) {
           <table className="w-full text-xs font-mono" style={{ borderCollapse:'collapse' }}>
             <thead style={{ position:'sticky', top:0, background:'var(--bg-elevated)' }}>
               <tr>
-                {['#','RUL Réel (h)','RUL Prédit (h)','Erreur abs. (h)','Erreur (%)','Qualité'].map(h => (
+                {['#','RUL Réel (h)','RUL Prédit (j)','Erreur abs. (h)','Erreur (%)','Qualité'].map(h => (
                   <th key={h} className="px-3 py-1.5 text-left whitespace-nowrap"
                     style={{ color:'var(--text-tertiary)', borderBottom:'1px solid var(--border-default)' }}>{h}</th>
                 ))}
@@ -385,9 +415,9 @@ function PredictionsView({ data, hyperparams }) {
                 return (
                   <tr key={i} style={{ background: i%2===0?'var(--bg-card)':'#15172a', borderBottom:'1px solid var(--bg-card-alt)' }}>
                     <td className="px-3 py-1.5" style={{ color:'var(--text-muted)' }}>{i+1}</td>
-                    <td className="px-3 py-1.5 font-bold" style={{ color:'var(--success)' }}>{real.toFixed(1)}h</td>
-                    <td className="px-3 py-1.5 font-bold" style={{ color:'var(--accent-blue)' }}>{pred.toFixed(1)}h</td>
-                    <td className="px-3 py-1.5" style={{ color: err<10?'var(--accent-green)': err<30?'var(--accent-orange)':'var(--error)' }}>{err.toFixed(1)}h</td>
+                    <td className="px-3 py-1.5 font-bold" style={{ color:'var(--success)' }}>{real.toFixed(1)} j</td>
+                    <td className="px-3 py-1.5 font-bold" style={{ color:'var(--accent-blue)' }}>{pred.toFixed(1)} j</td>
+                    <td className="px-3 py-1.5" style={{ color: err<10?'var(--accent-green)': err<30?'var(--accent-orange)':'var(--error)' }}>{err.toFixed(1)} j</td>
                     <td className="px-3 py-1.5" style={{ color:'var(--text-tertiary)' }}>{pct}%</td>
                     <td className="px-3 py-1.5">
                       <span className="px-1.5 py-0.5 rounded text-xs" style={{ background:qual.color+'20', color:qual.color }}>
@@ -406,326 +436,78 @@ function PredictionsView({ data, hyperparams }) {
   );
 }
 
-// ════════════════════════════════════════════════════════════
-// 🎨 ArchitectureVisualizer — Schéma vivant style Andrew Ng
-// ════════════════════════════════════════════════════════════
-function ArchitectureVisualizer({
-  arch, numLayers, units, dropouts, batchSize, lookback, machineId
-}) {
-  const archColor = ARCH_COLORS[arch] || 'var(--accent-blue)';
+// ─── ArchitectureVisualizer extrait dans son propre fichier (Phase 3) ───
+// Voir ./ArchitectureVisualizer.jsx
 
-  // Limites visuelles : on plafonne le nombre de neurones affichés
-  const N_FEATURES = 31;
-  const N_FEATURES_DISPLAY = 8;  // on en affiche 8 visuellement
-  const MAX_VISIBLE_NEURONS = 12; // par couche
-  const visibleUnits = units.slice(0, numLayers).map(u => Math.min(u, MAX_VISIBLE_NEURONS));
-
-  // Dimensions SVG dynamiques
-  const W = 900;
-  const layerSpacing = (W - 200) / (numLayers + 2);
-  const inputX = 100;
-  const outputX = W - 80;
-  const layerXs = visibleUnits.map((_, i) => inputX + (i + 1) * layerSpacing);
-  const H = 380;
-
-  // Y-positions des neurones d'une couche
-  const neuronYs = (n, cy = H/2, height = 280) => {
-    const step = Math.min(28, height / Math.max(1, n - 1));
-    return Array.from({ length: n }, (_, i) =>
-      cy - ((n - 1) / 2) * step + i * step
-    );
-  };
-
-  const inputYs = neuronYs(N_FEATURES_DISPLAY);
-  const layerNeuronYs = visibleUnits.map(n => neuronYs(n));
-
-  // Génère un masque de dropout aléatoire (recalculé à chaque rendu — comme dans la réalité !)
-  const dropoutMasks = useMemo(() =>
-    visibleUnits.map((n, L) => {
-      const rate = dropouts[L] || 0;
-      return Array.from({ length: n }, () => Math.random() < rate);
-    }),
-    [visibleUnits.join(','), dropouts.slice(0, numLayers).join(','), Date.now() % 100]
-  );
-
-  return (
-    <div className="rounded-xl border-2 overflow-hidden"
-      style={{ borderColor: archColor, background: 'linear-gradient(135deg, var(--bg-base), var(--bg-card))' }}>
-      <div className="px-4 py-2.5 flex items-center justify-between"
-        style={{ background: archColor + '15', borderBottom: `1px solid ${archColor}40` }}>
-        <div className="flex items-center gap-2">
-          <Eye size={15} style={{ color: archColor }} />
-          <span className="text-sm font-bold" style={{ color: archColor }}>
-            🎨 Architecture en direct — {arch}
-          </span>
-        </div>
-        <span className="text-xs font-mono" style={{ color: 'var(--text-muted)' }}>
-          Aperçu avant entraînement
-        </span>
-      </div>
-
-      <svg viewBox={`0 0 ${W} ${H}`} className="w-full" style={{ maxHeight: 420 }}>
-        <defs>
-          <pattern id="archgrid" width="40" height="40" patternUnits="userSpaceOnUse">
-            <path d="M 40 0 L 0 0 0 40" fill="none" stroke="var(--bg-card)" strokeWidth="0.4"/>
-          </pattern>
-          <marker id="archarrow" markerWidth="5" markerHeight="5" refX="4" refY="2.5"
-            orient="auto" markerUnits="strokeWidth">
-            <path d="M0,0 L0,5 L5,2.5 z" fill="var(--text-tertiary)"/>
-          </marker>
-        </defs>
-        <rect width={W} height={H} fill="url(#archgrid)" />
-
-        {/* ── Pile de batch sur le côté gauche (mémoire visuelle du batch_size) ── */}
-        <g>
-          {/* Profondeur de pile : on dessine 5 plans translucides pour figurer le batch */}
-          {[0, 1, 2, 3].map(d => (
-            <rect key={d}
-              x={inputX - 50 - d * 4} y={50 - d * 4}
-              width={70} height={H - 100}
-              rx={4}
-              fill="#1a3a5c"
-              stroke="var(--accent-blue)"
-              strokeWidth={0.6}
-              opacity={0.15 + d * 0.08}
-            />
-          ))}
-          <rect x={inputX - 50} y={50}
-            width={70} height={H - 100} rx={4}
-            fill="#0d2a4a" stroke="var(--accent-blue)" strokeWidth={1.5}/>
-          <text x={inputX - 15} y={42} textAnchor="middle" fontSize={11}
-            fill="var(--accent-blue)" fontFamily="monospace" fontWeight="bold">
-            BATCH
-          </text>
-          <text x={inputX - 15} y={H - 36} textAnchor="middle" fontSize={11}
-            fill="var(--accent-blue)" fontFamily="monospace" fontWeight="bold">
-            {batchSize} séqs
-          </text>
-          <text x={inputX - 15} y={H - 22} textAnchor="middle" fontSize={9}
-            fill="var(--text-tertiary)" fontFamily="monospace">
-            en parallèle
-          </text>
-        </g>
-
-        {/* Indication de la fenêtre temporelle */}
-        <g transform={`translate(${inputX - 15}, ${H/2})`}>
-          <text textAnchor="middle" fontSize={10}
-            fill="var(--accent-green)" fontFamily="monospace" fontWeight="bold">
-            ⏱ {lookback}h
-          </text>
-          <text y={14} textAnchor="middle" fontSize={8}
-            fill="var(--text-muted)" fontFamily="monospace">
-            window
-          </text>
-        </g>
-
-        {/* ── Titres de colonnes ── */}
-        <text x={inputX} y={20} textAnchor="middle" fontSize={11}
-          fill="var(--text-tertiary)" fontFamily="monospace" fontWeight="bold">
-          INPUT
-        </text>
-        <text x={inputX} y={34} textAnchor="middle" fontSize={9}
-          fill="var(--text-muted)" fontFamily="monospace">
-          {N_FEATURES} features
-        </text>
-
-        {layerXs.map((x, L) => {
-          const dropoutRate = dropouts[L] || 0;
-          return (
-            <g key={`title-${L}`}>
-              <text x={x} y={20} textAnchor="middle" fontSize={11}
-                fill={archColor} fontFamily="monospace" fontWeight="bold">
-                {arch}_{L + 1}
-              </text>
-              <text x={x} y={34} textAnchor="middle" fontSize={9}
-                fill="var(--text-muted)" fontFamily="monospace">
-                {units[L]} unités
-              </text>
-              {dropoutRate > 0 && (
-                <text x={x} y={48} textAnchor="middle" fontSize={9}
-                  fill="#f06292" fontFamily="monospace">
-                  dropout {(dropoutRate * 100).toFixed(0)}%
-                </text>
-              )}
-            </g>
-          );
-        })}
-
-        <text x={outputX} y={20} textAnchor="middle" fontSize={11}
-          fill="#f06292" fontFamily="monospace" fontWeight="bold">
-          DENSE
-        </text>
-        <text x={outputX} y={34} textAnchor="middle" fontSize={9}
-          fill="var(--text-muted)" fontFamily="monospace">
-          1 unité (RUL)
-        </text>
-
-        {/* ── Connexions input → couche 1 ── */}
-        {inputYs.map((iy, i) =>
-          layerNeuronYs[0]?.map((ly, j) => (
-            <line key={`in-${i}-${j}`}
-              x1={inputX + 14} y1={iy}
-              x2={layerXs[0] - 14} y2={ly}
-              stroke={archColor} strokeWidth={0.3} opacity={0.25}/>
-          ))
-        )}
-
-        {/* ── Connexions entre couches ── */}
-        {layerXs.slice(0, -1).map((x1, L) => (
-          <g key={`conn-${L}`}>
-            {layerNeuronYs[L]?.map((y1, i) =>
-              layerNeuronYs[L + 1]?.map((y2, j) => (
-                <line key={`l-${L}-${i}-${j}`}
-                  x1={x1 + 14} y1={y1}
-                  x2={layerXs[L + 1] - 14} y2={y2}
-                  stroke={archColor} strokeWidth={0.3} opacity={0.25}/>
-              ))
-            )}
-          </g>
-        ))}
-
-        {/* ── Connexions dernière couche → DENSE ── */}
-        {layerNeuronYs[numLayers - 1]?.map((ly, i) => (
-          <line key={`out-${i}`}
-            x1={layerXs[numLayers - 1] + 14} y1={ly}
-            x2={outputX - 14} y2={H/2}
-            stroke="#f06292" strokeWidth={0.5} opacity={0.4}/>
-        ))}
-
-        {/* ── Récurrence (si RNN/LSTM/GRU) ── */}
-        {(arch === 'LSTM' || arch === 'GRU' || arch === 'RNN') &&
-          layerXs.map((x, L) => (
-            <g key={`rec-${L}`}>
-              <path
-                d={`M ${x + 14} ${H/2 - 80}
-                    C ${x + 50} ${H/2 - 130}, ${x + 50} ${H/2 + 130}, ${x + 14} ${H/2 + 80}`}
-                fill="none" stroke={archColor} strokeWidth={0.8}
-                opacity={0.5} markerEnd="url(#archarrow)" strokeDasharray="3,2"/>
-              <text x={x + 56} y={H/2 + 4} fontSize={9}
-                fill={archColor} fontFamily="monospace">
-                ↺ récur.
-              </text>
-            </g>
-          ))
-        }
-
-        {/* ── Neurones d'entrée (carrés bleus) ── */}
-        {inputYs.map((y, i) => (
-          <g key={`in-${i}`}>
-            <rect x={inputX - 14} y={y - 9} width={28} height={18} rx={3}
-              fill="#1a3a5c" stroke="var(--accent-blue)" strokeWidth={1}/>
-            <text x={inputX} y={y + 3} textAnchor="middle" fontSize={8}
-              fill="var(--accent-blue)" fontFamily="monospace">
-              x{i + 1}
-            </text>
-          </g>
-        ))}
-        {/* Indicateur "..." si on tronque les features */}
-        {N_FEATURES > N_FEATURES_DISPLAY && (
-          <text x={inputX} y={inputYs[inputYs.length-1] + 22} textAnchor="middle" fontSize={9}
-            fill="var(--text-muted)" fontFamily="monospace">
-            ... ({N_FEATURES - N_FEATURES_DISPLAY} de plus)
-          </text>
-        )}
-
-        {/* ── Neurones cachés avec animation dropout ── */}
-        {layerNeuronYs.map((ys, L) =>
-          ys.map((y, j) => {
-            const isDropped = dropoutMasks[L]?.[j] || false;
-            return (
-              <motion.g key={`n-${L}-${j}`}
-                animate={{
-                  opacity: isDropped ? 0.2 : 1,
-                  scale: isDropped ? 0.7 : 1,
-                }}
-                transition={{ duration: 0.5 }}
-              >
-                <circle cx={layerXs[L]} cy={y} r={11}
-                  fill={isDropped ? 'var(--bg-card)' : archColor + '30'}
-                  stroke={isDropped ? 'var(--text-muted)' : archColor}
-                  strokeWidth={isDropped ? 1 : 1.5}
-                  strokeDasharray={isDropped ? '2,2' : 'none'}
-                />
-                {!isDropped && (
-                  <text x={layerXs[L]} y={y + 3} textAnchor="middle" fontSize={8}
-                    fill={archColor} fontFamily="monospace" fontWeight="bold">
-                    h{j + 1}
-                  </text>
-                )}
-                {isDropped && (
-                  <text x={layerXs[L]} y={y + 3} textAnchor="middle" fontSize={9}
-                    fill="var(--text-muted)" fontFamily="monospace">
-                    ✕
-                  </text>
-                )}
-              </motion.g>
-            );
-          })
-        )}
-
-        {/* Indicateur "..." si neurones tronqués */}
-        {layerXs.map((x, L) => {
-          const totalUnits = units[L];
-          if (totalUnits > MAX_VISIBLE_NEURONS) {
-            const lastY = layerNeuronYs[L][layerNeuronYs[L].length - 1];
-            return (
-              <text key={`trunc-${L}`} x={x} y={lastY + 22} textAnchor="middle" fontSize={9}
-                fill="var(--text-muted)" fontFamily="monospace">
-                ... ({totalUnits - MAX_VISIBLE_NEURONS} de +)
-              </text>
-            );
-          }
-          return null;
-        })}
-
-        {/* ── Neurone de sortie ── */}
-        <g>
-          <circle cx={outputX} cy={H/2} r={16}
-            fill="#f0629230" stroke="#f06292" strokeWidth={2}/>
-          <text x={outputX} y={H/2 + 4} textAnchor="middle" fontSize={11}
-            fill="#f06292" fontFamily="monospace" fontWeight="bold">
-            ŷ
-          </text>
-          <text x={outputX} y={H/2 + 34} textAnchor="middle" fontSize={9}
-            fill="#f06292" fontFamily="monospace">
-            RUL (h)
-          </text>
-        </g>
-
-        {/* ── Légende en bas ── */}
-        <g transform={`translate(${W/2 - 250}, ${H - 18})`}>
-          <rect x={0} y={-8} width={500} height={16} rx={8}
-            fill="var(--bg-card)" stroke="var(--border-default)"/>
-          <circle cx={20} cy={0} r={4} fill={archColor + '30'} stroke={archColor}/>
-          <text x={30} y={3} fontSize={9} fill="var(--text-tertiary)" fontFamily="monospace">neurone actif</text>
-          <circle cx={140} cy={0} r={4} fill="var(--bg-card)" stroke="var(--text-muted)" strokeDasharray="2,2"/>
-          <text x={150} y={3} fontSize={9} fill="var(--text-tertiary)" fontFamily="monospace">neurone "dropé"</text>
-          <text x={260} y={3} fontSize={9} fill="var(--accent-blue)" fontFamily="monospace">📦 batch={batchSize}</text>
-          <text x={360} y={3} fontSize={9} fill="var(--accent-green)" fontFamily="monospace">⏱ window={lookback}h</text>
-        </g>
-      </svg>
-
-      {/* Note pédagogique sur la couche Dense */}
-      <div className="px-4 py-2.5 border-t" style={{ borderColor: 'var(--border-default)', background: 'var(--bg-deep)' }}>
-        <p className="text-xs leading-relaxed" style={{ color: 'var(--text-tertiary)' }}>
-          💡 <b style={{color:'#f06292'}}>Dense final = 1 neurone fixe</b> (non configurable) —
-          c'est imposé par le problème : on prédit <b>une seule valeur</b> (la RUL en heures).<br/>
-          Si on prédisait plusieurs choses à la fois (ex: RUL + probabilité de panne), il y aurait plusieurs neurones.
-        </p>
-      </div>
-    </div>
-  );
-}
-
-// ════════════════════════════════════════════════════════════
-// Panel principal
-// ════════════════════════════════════════════════════════════
 export default function TrainingPanel() {
-  const [mode,      setMode]      = useState('manual');
-  const [arch,      setArch]      = useState('LSTM');
-  const [expName,   setExpName]   = useState('Exp_LSTM_01');
-  const [machineId, setMachineId] = useState(99);
-  const [lookback,  setLookback]  = useState(24);  // Fenêtre temporelle (heures)
+  // Dataset Cevital partagé (depuis AppContext, sync avec PreparationPanel)
+  const {
+    currentDatasetId, selectDataset, preprocResult,
+    pendingRetrain, consumeRetrain,
+    goToTab, datasetVersion,
+  } = useApp();
+
+  const [mode,         setMode]         = useState('manual');
+  const [arch,         setArch]         = useState('LSTM');
+  const [expName,      setExpName]      = useState('Exp_LSTM_01');
+  const [embeddingDim, setEmbeddingDim] = useState(8);
+  // Lookback en JOURS (Cevital). Lecture seule depuis preprocResult si dispo.
+  const lookbackFromPrep = preprocResult?.lookback ?? 30;
+  const [lookback,  setLookback]  = useState(lookbackFromPrep);
+
+  // Synchroniser lookback avec preproc si user a relancé le preprocessing
+  useEffect(() => {
+    if (preprocResult?.lookback) setLookback(preprocResult.lookback);
+  }, [preprocResult?.lookback]);
+
+  // 🔄 Pré-remplissage depuis le Leaderboard ("Re-entraîner")
+  //
+  // ✅ Lot B : on NE change PAS le dataset actif. L'utilisateur garde le
+  // dataset qu'il a sélectionné dans la card 📦 DATASET. Il peut donc
+  // appliquer les hyperparams d'un modèle entraîné sur dataset A à
+  // n'importe quel dataset preprocessed (dataset B fusionné, par exemple).
+  useEffect(() => {
+    if (!pendingRetrain) return;
+    const { hyperparams: hp, architecture, mode: m, name } = pendingRetrain;
+    // ⚠️ dataset_id intentionnellement IGNORÉ — voir commentaire ci-dessus
+    if (architecture) setArch(architecture);
+    if (m) setMode(m);
+    if (name) setExpName(name);
+    if (hp) {
+      if (hp.embedding_dim != null) setEmbeddingDim(hp.embedding_dim);
+      if (hp.num_layers    != null) setNumLayers(hp.num_layers);
+      if (Array.isArray(hp.units))         setUnits([...hp.units, 32, 32, 32].slice(0, 4));
+      if (Array.isArray(hp.dropout_rates)) setDropouts([...hp.dropout_rates, 0.1, 0.1, 0.1].slice(0, 4));
+      if (hp.learning_rate != null) setLr(hp.learning_rate);
+      if (hp.epochs        != null) setEpochs(hp.epochs);
+      if (hp.batch_size    != null) setBatchSize(hp.batch_size);
+      if (hp.patience      != null) setPatience(hp.patience);
+      if (hp.lookback      != null) setLookback(hp.lookback);
+    }
+    consumeRetrain();
+    setTimeout(() => addLog(
+      `✓ Hyperparamètres chargés depuis "${name || '…'}" — choisis le dataset à entraîner et lance.`
+    ), 50);
+  }, [pendingRetrain, consumeRetrain]);
+
+  // Liste des datasets dispo (pour la card 📦 DATASET)
+  // 🆕 Re-fetch quand `datasetVersion` change (après preprocessing OK p.ex.)
+  // → garantit que `currentDataset.status` est à jour.
+  const [datasets, setDatasets] = useState([]);
+  useEffect(() => {
+    fetch(`${API}/api/datasets`)
+      .then(r => r.json())
+      .then(d => setDatasets(Array.isArray(d) ? d : []))
+      .catch(() => setDatasets([]));
+  }, [datasetVersion]);
+  const currentDataset = useMemo(
+    () => datasets.find(d => d.id === currentDatasetId),
+    [datasets, currentDatasetId],
+  );
+  const datasetReady = currentDataset?.status === 'preprocessed';
+  const numClassesComp = preprocResult?.num_classes_comp
+    ?? currentDataset?.n_composants
+    ?? 100;
 
   // Manuel
   const [numLayers, setNumLayers] = useState(2);
@@ -737,16 +519,20 @@ export default function TrainingPanel() {
   const [patience,  setPatience]  = useState(10);
 
   // AutoML
-  const [layersMin, setLayersMin] = useState(1);
-  const [layersMax, setLayersMax] = useState(4);
-  const [unitsMin,  setUnitsMin]  = useState(32);
-  const [unitsMax,  setUnitsMax]  = useState(256);
-  const [dropMin,   setDropMin]   = useState(0.1);
-  const [dropMax,   setDropMax]   = useState(0.5);
-  const [maxTrials, setMaxTrials] = useState(10);
-  const [cvFolds,   setCvFolds]   = useState(5);
-  const [trialEp,   setTrialEp]   = useState(20);
-  const [finalEp,   setFinalEp]   = useState(50);
+  // AutoML — bornes espace de recherche gp_minimize (défauts = notebook PFE exact)
+  const [layersMin,  setLayersMin]  = useState(1);
+  const [layersMax,  setLayersMax]  = useState(1);     // notebook : 1 couche LSTM
+  const [unitsMin,   setUnitsMin]   = useState(32);    // notebook : Integer(32, 128)
+  const [unitsMax,   setUnitsMax]   = useState(128);
+  const [unitsStep,  setUnitsStep]  = useState(32);    // ignoré par gp_minimize
+  const [dropMin,    setDropMin]    = useState(0.10);  // notebook : Real(0.1, 0.4)
+  const [dropMax,    setDropMax]    = useState(0.40);
+  const [lrChoices,  setLrChoices]  = useState([1e-4, 1e-2]); // notebook : Real(1e-4, 1e-2, log-uniform)
+  const [embSearch,  setEmbSearch]  = useState([4, 8, 16, 32]);
+  const [maxTrials,  setMaxTrials]  = useState(20);   // notebook : N_CALLS=20
+  const [trialEp,    setTrialEp]    = useState(20);   // notebook : EPOCHS_CV=20
+  const [finalEp,    setFinalEp]    = useState(35);   // notebook : EPOCHS_FIN=35
+  const [cvFolds,    setCvFolds]    = useState(3);    // notebook : N_CV_FOLDS=3
 
   // État
   const [trainingStatus, setTrainingStatus] = useState('idle');
@@ -759,6 +545,11 @@ export default function TrainingPanel() {
   const [hyperparams, setHyperparams] = useState(null);
   const [activeTab,   setActiveTab]   = useState('live');
   const [startTime,   setStartTime]   = useState(null);
+  // ⚠️ Logique Azure : on N'a PAS de carte custom AutoML. La progression dans
+  // un trial est montrée par `KerasEpochBar` (epoch courant) + onglet Trials
+  // (essais terminés). Les events `trial_start` / `trial_end` ne servent qu'à
+  // alimenter `trialData` (pour l'onglet Trials) et à logger dans la zone
+  // "Logs en direct".
 
   const wsRef  = useRef(null);
   const logRef = useRef(null);
@@ -797,6 +588,10 @@ export default function TrainingPanel() {
           case 'trial_end':
             setTrialData(prev => [...prev, { trial:data.trial, avg_cv_loss:data.avg_cv_loss, duration:data.duration }]);
             addLog(`  ✅ Essai ${data.trial} terminé — CV Loss: ${data.avg_cv_loss?.toFixed(5)}`);
+            // Si c'était le dernier essai → on signale le re-train final dans les logs
+            if (data.trial >= maxTrials) {
+              addLog(`\n🏗️ Phase 2 — Entraînement final sur le best model (${finalEp} époques, EarlyStopping + ReduceLROnPlateau)…`);
+            }
             break;
           case 'result':
             setResult(data);
@@ -807,7 +602,7 @@ export default function TrainingPanel() {
             setTrainingStatus('completed');
             if (data.predictions) { setPredictions(data.predictions); setActiveTab('predictions'); }
             if (data.hyperparameters) setHyperparams(data.hyperparameters);
-            addLog(`\n🏁 Entraînement terminé ! R²=${data.r2?.toFixed(4)} | MAE=${data.mae_hours?.toFixed(1)}h`);
+            addLog(`\n🏁 Entraînement terminé ! R²=${data.r2?.toFixed(4)} | MAE=${data.mae?.toFixed(2)}j`);
             break;
           case 'error':
             setTrainingStatus('error');
@@ -821,31 +616,67 @@ export default function TrainingPanel() {
   };
 
   const handleTrain = useCallback(async () => {
+    if (!currentDatasetId) {
+      addLog('❌ Aucun dataset sélectionné. Va dans "Préparation Données".');
+      return;
+    }
+    if (!datasetReady) {
+      addLog('❌ Le dataset n\'est pas encore prétraité. Lance le Prétraitement d\'abord.');
+      return;
+    }
     resetState();
     setTrainingStatus('running');
     setStartTime(Date.now());
+    addLog(mode === 'auto'
+      ? `🚀 Lancement AutoML Bayésien (${maxTrials} essais × CV 3 folds × ${trialEp} ep/fold — puis re-train ${finalEp} ep)…`
+      : `🚀 Lancement entraînement Manuel (${epochs} époques)…`
+    );
     const url = mode==='manual' ? `${API}/api/train/manual` : `${API}/api/train/auto`;
     const payload = mode==='manual'
-      ? { name:expName, architecture:arch, machine_id:machineId, lookback,
-          num_layers:numLayers,
-          units:units.slice(0,numLayers), dropout_rates:dropouts.slice(0,numLayers),
-          learning_rate:lr, epochs, batch_size:batchSize, patience }
-      : { name:expName, architecture:arch, machine_id:machineId, lookback,
-          layers_min:layersMin, layers_max:layersMax, units_min:unitsMin, units_max:unitsMax,
-          units_step:32, dropout_min:dropMin, dropout_max:dropMax,
-          lr_choices:[0.01,0.001,0.0001], max_trials:maxTrials, cv_folds:cvFolds,
-          epochs_per_trial:trialEp, final_epochs:finalEp, batch_size:batchSize };
+      ? {
+          dataset_id:    currentDatasetId,
+          name:          expName,
+          architecture:  arch,
+          embedding_dim: embeddingDim,
+          num_layers:    numLayers,
+          units:         units.slice(0, numLayers),
+          dropout_rates: dropouts.slice(0, numLayers),
+          learning_rate: lr,
+          epochs,
+          batch_size:    batchSize,
+          patience,
+        }
+      : {
+          dataset_id:       currentDatasetId,
+          name:             expName,
+          architecture:     arch,
+          max_trials:       maxTrials,
+          epochs:           trialEp,         // = époques PAR ESSAI bayésien
+          batch_size:       batchSize,
+          patience,
+          embedding_search: embSearch,
+          units_min:        unitsMin,
+          units_max:        unitsMax,
+          units_step:       unitsStep,
+          nb_layers_min:    layersMin,
+          nb_layers_max:    layersMax,
+          dropout_min:      dropMin,
+          dropout_max:      dropMax,
+          lr_choices:       lrChoices,
+          final_epochs:     finalEp,         // = re-entraînement final du best model
+        };
     try {
       const res  = await fetch(url, { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(payload) });
       const data = await res.json();
-      if (!res.ok) throw new Error(data.detail||'Erreur serveur');
+      if (!res.ok) throw new Error(typeof data.detail === 'string' ? data.detail : 'Erreur serveur');
       connectWS(data.experiment_id);
     } catch(e) {
       addLog(`❌ ${e.message}`);
       setTrainingStatus('error');
     }
-  }, [mode, arch, expName, machineId, lookback, numLayers, units, dropouts, lr, epochs, batchSize, patience,
-      layersMin, layersMax, unitsMin, unitsMax, dropMin, dropMax, maxTrials, cvFolds, trialEp, finalEp]);
+  }, [currentDatasetId, datasetReady, mode, arch, expName, embeddingDim,
+      numLayers, units, dropouts, lr, epochs, batchSize, patience,
+      maxTrials, trialEp]);
 
   const TABS = [
     { id:'live',        label:'⚡ Live',          show: true },
@@ -876,6 +707,14 @@ export default function TrainingPanel() {
           </div>
         </div>
 
+        {/* ── 🆕 Card DATASET ── (Phase 3 — tout en haut) */}
+        <DatasetCard
+          datasets={datasets}
+          currentDataset={currentDataset}
+          currentDatasetId={currentDatasetId}
+          onSelect={selectDataset}
+        />
+
         {/* Mode */}
         <div className="rounded-xl border p-4" style={{ background:'var(--bg-card)', borderColor:'var(--border-default)' }}>
           <p className={lblCls} style={{ color:'var(--text-tertiary)' }}>Mode</p>
@@ -884,7 +723,7 @@ export default function TrainingPanel() {
               <button key={m} onClick={()=>setMode(m)}
                 className="flex-1 py-2 rounded-lg text-sm font-semibold border transition-all"
                 style={{
-                  background: mode===m?(m==='manual'?'#1a3a5c':'var(--tint-success-bg)'):'var(--bg-elevated)',
+                  background: mode===m?(m==='manual'?'var(--tint-info-bg)':'var(--tint-success-bg)'):'var(--bg-elevated)',
                   borderColor: mode===m?(m==='manual'?'var(--accent-blue)':'var(--accent-green)'):'var(--border-default)',
                   color: mode===m?(m==='manual'?'var(--accent-blue)':'var(--accent-green)'):'var(--text-muted)',
                 }}>
@@ -894,63 +733,80 @@ export default function TrainingPanel() {
           </div>
         </div>
 
-        {/* Architecture */}
+        {/* Architecture — LSTM/GRU enabled, RNN/Transformer grisés */}
         <div className="rounded-xl border p-4" style={{ background:'var(--bg-card)', borderColor:'var(--border-default)' }}>
           <p className={lblCls} style={{ color:'var(--text-tertiary)' }}>Architecture</p>
           <div className="grid grid-cols-2 gap-2">
-            {Object.entries(ARCH_COLORS).map(([a,color]) => (
-              <button key={a} onClick={()=>setArch(a)}
-                className="py-2 rounded-lg text-sm font-bold border transition-all"
+            {ARCH_DEF.map(({ id:a, color, enabled }) => (
+              <button key={a}
+                onClick={() => { if (enabled) setArch(a); }}
+                disabled={!enabled}
+                title={enabled ? `Choisir ${a}` : 'Réservé aux démos pédagogiques (pas dans le pipeline Cevital)'}
+                className="py-2 rounded-lg text-sm font-bold border transition-all flex items-center justify-center gap-1.5"
                 style={{
-                  background: arch===a?color+'20':'var(--bg-elevated)',
-                  borderColor: arch===a?color:'var(--border-default)',
-                  color: arch===a?color:'var(--text-muted)',
+                  background:  arch === a && enabled ? `color-mix(in srgb, ${color} 18%, var(--bg-card))` : 'var(--bg-elevated)',
+                  borderColor: arch === a && enabled ? color : 'var(--border-default)',
+                  color:       !enabled ? 'var(--text-muted)' : (arch === a ? color : 'var(--text-secondary)'),
+                  cursor:      enabled ? 'pointer' : 'not-allowed',
+                  opacity:     enabled ? 1 : 0.55,
                 }}>
+                {!enabled && <Lock size={11} />}
                 {a}
               </button>
             ))}
           </div>
+          <p className="text-[11px] mt-2" style={{ color: 'var(--text-muted)' }}>
+            💡 Cevital = LSTM ou GRU (avec Embedding composant). RNN/Transformer restent visibles
+            dans l'onglet <b>Démo</b> à titre pédagogique.
+          </p>
         </div>
 
-        {/* Nom + machine */}
+        {/* 🆕 Card PARAMÈTRES MODÈLE */}
+        <ModelParamsCard
+          embeddingDim={embeddingDim}
+          setEmbeddingDim={setEmbeddingDim}
+          mode={mode}
+        />
+
+        {/* Nom de l'expérience + Fenêtre temporelle (en JOURS) */}
         <div className="rounded-xl border p-4 space-y-3" style={{ background:'var(--bg-card)', borderColor:'var(--border-default)' }}>
           <div>
             <label className={lblCls} style={{ color:'var(--text-tertiary)' }}>Nom de l'expérience</label>
             <input className={inputCls} style={inputSty} value={expName} onChange={e=>setExpName(e.target.value)} />
           </div>
-          <div>
-            <label className={lblCls} style={{ color:'var(--text-tertiary)' }}>Machine ID</label>
-            <input className={inputCls} style={inputSty} type="number" value={machineId}
-              onChange={e=>setMachineId(Number(e.target.value))} min={1} max={100} />
-          </div>
-          {/* ⏱ Fenêtre temporelle (lookback) */}
-          <div>
-            <label className={lblCls} style={{ color:'var(--text-tertiary)' }}>
-              ⏱ Fenêtre temporelle — {lookback}h
-            </label>
-            <div className="grid grid-cols-5 gap-1.5 mb-2">
-              {[12, 24, 48, 72, 168].map(h => (
-                <button key={h} onClick={() => setLookback(h)}
-                  className="px-1 py-1.5 rounded text-xs font-mono border transition-all"
-                  style={{
-                    background: lookback === h ? 'var(--tint-success-bg)' : 'var(--bg-elevated)',
-                    borderColor: lookback === h ? 'var(--accent-green)' : 'var(--border-default)',
-                    color: lookback === h ? 'var(--accent-green)' : 'var(--text-tertiary)',
-                  }}>
-                  {h}h
-                </button>
-              ))}
+
+          {/* ⏱ Fenêtre temporelle (lookback) — READ-ONLY, défini en Prétraitement */}
+          <div className="rounded-lg border p-3"
+            style={{
+              background:  'var(--bg-elevated)',
+              borderColor: 'var(--accent-blue)',
+              borderStyle: 'dashed',
+            }}>
+            <div className="flex items-center justify-between gap-2">
+              <div>
+                <p className={lblCls} style={{ color:'var(--text-tertiary)' }}>
+                  ⏱ Fenêtre temporelle (lookback)
+                </p>
+                <p className="text-2xl font-bold font-mono mt-1"
+                   style={{ color: 'var(--accent-blue)' }}>
+                  {lookback} jours
+                </p>
+              </div>
+              <button onClick={() => goToTab?.('prep')}
+                className="px-2 py-1 rounded text-xs font-semibold border whitespace-nowrap"
+                style={{
+                  background:  'var(--bg-card)',
+                  borderColor: 'var(--accent-blue)',
+                  color:       'var(--accent-blue)',
+                }}>
+                ✏️ Modifier dans Prétraitement →
+              </button>
             </div>
-            <input className={inputCls} style={inputSty} type="number"
-              value={lookback}
-              min={3} max={336} step={1}
-              placeholder="Valeur libre (3 - 336h)"
-              onChange={e => {
-                const v = Number(e.target.value);
-                if (v >= 3 && v <= 336) setLookback(v);
-              }}/>
-            <p className="text-xs mt-1" style={{ color: 'var(--text-muted)' }}>
-              💡 Combien d'heures d'historique le modèle voit-il à chaque pas ? Plus c'est long, mieux il capture les tendances mais plus l'entraînement est lent.
+            <p className="text-[11px] mt-2" style={{ color: 'var(--text-muted)' }}>
+              🔒 Cette valeur est <b>figée</b> par le Prétraitement (étape qui construit les
+              séquences de shape <code>(N, {lookback}, n_features)</code>). Si tu veux changer
+              le lookback, va sur l'onglet <b>Préparation Données → Prétraitement</b>, lance
+              un nouveau prétraitement, et reviens entraîner.
             </p>
           </div>
         </div>
@@ -1008,28 +864,20 @@ export default function TrainingPanel() {
             </>
           ) : (
             <>
-              <div className="grid grid-cols-2 gap-2">
-                {[
-                  {label:'Couches min', val:layersMin, set:setLayersMin, min:1, max:4},
-                  {label:'Couches max', val:layersMax, set:setLayersMax, min:1, max:6},
-                  {label:'Unités min',  val:unitsMin,  set:setUnitsMin,  min:8, max:512},
-                  {label:'Unités max',  val:unitsMax,  set:setUnitsMax,  min:8, max:512},
-                  {label:'Dropout min', val:dropMin,   set:setDropMin,   min:0, max:0.9, step:0.05},
-                  {label:'Dropout max', val:dropMax,   set:setDropMax,   min:0, max:0.9, step:0.05},
-                ].map(f=>(
-                  <div key={f.label}>
-                    <label className="text-xs mb-1 block" style={{color:'var(--text-tertiary)'}}>{f.label}</label>
-                    <input className={inputCls} style={inputSty} type="number"
-                      value={f.val} onChange={e=>f.set(Number(e.target.value))} min={f.min} max={f.max} step={f.step||1}/>
-                  </div>
-                ))}
+              {/* AutoML — Section 1 : paramètres généraux */}
+              <div className="rounded-lg p-2 mb-2 text-[11px]"
+                style={{ background:'var(--tint-success-bg)',
+                         borderLeft:'3px solid var(--accent-green)',
+                         color:'var(--text-secondary)' }}>
+                ⚙️ <b>Paramètres généraux AutoML</b>
               </div>
               <div className="grid grid-cols-2 gap-2">
                 {[
-                  {label:'Essais Bayésiens', val:maxTrials, set:setMaxTrials, min:3, max:30},
-                  {label:'Plis CV',          val:cvFolds,  set:setCvFolds,   min:2, max:10},
-                  {label:'Époques / essai',  val:trialEp,  set:setTrialEp,   min:5, max:100},
-                  {label:'Époques finales',  val:finalEp,  set:setFinalEp,   min:10, max:500},
+                  {label:'Essais Bayésiens',       val:maxTrials, set:setMaxTrials, min:2, max:30},
+                  {label:'Époques / essai',        val:trialEp,   set:setTrialEp,   min:3, max:100},
+                  {label:'Époques finales (best)', val:finalEp,   set:setFinalEp,   min:5, max:500},
+                  {label:'Batch size',             val:batchSize, set:setBatchSize, min:8, max:512},
+                  {label:'Early stopping',         val:patience,  set:setPatience,  min:3, max:50},
                 ].map(f=>(
                   <div key={f.label}>
                     <label className="text-xs mb-1 block" style={{color:'var(--text-tertiary)'}}>{f.label}</label>
@@ -1038,24 +886,105 @@ export default function TrainingPanel() {
                   </div>
                 ))}
               </div>
+
+              {/* AutoML — Section 2 : bornes Bayésien (CHOISISSABLES manuellement) */}
+              <div className="rounded-lg p-2 mt-3 mb-2 text-[11px]"
+                style={{ background:'var(--tint-info-bg)',
+                         borderLeft:'3px solid var(--accent-blue)',
+                         color:'var(--text-secondary)' }}>
+                🎛️ <b>Bornes de recherche Bayésienne</b> (défauts = notebook PFE_CHAMPION)
+              </div>
+              <div className="grid grid-cols-2 gap-2">
+                {[
+                  {label:'nb_layers min', val:layersMin, set:setLayersMin, min:1, max:4},
+                  {label:'nb_layers max', val:layersMax, set:setLayersMax, min:1, max:4},
+                  {label:'units min',     val:unitsMin,  set:setUnitsMin,  min:8, max:512},
+                  {label:'units max',     val:unitsMax,  set:setUnitsMax,  min:8, max:512},
+                  {label:'units step',    val:unitsStep, set:setUnitsStep, min:8, max:128},
+                  {label:'dropout min',   val:dropMin,   set:setDropMin,   min:0, max:0.9, step:0.05},
+                  {label:'dropout max',   val:dropMax,   set:setDropMax,   min:0, max:0.9, step:0.05},
+                ].map(f=>(
+                  <div key={f.label}>
+                    <label className="text-xs mb-1 block" style={{color:'var(--text-tertiary)'}}>{f.label}</label>
+                    <input className={inputCls} style={inputSty} type="number"
+                      value={f.val} onChange={e=>f.set(Number(e.target.value))}
+                      min={f.min} max={f.max} step={f.step || 1}/>
+                  </div>
+                ))}
+              </div>
+
+              {/* Embedding dim choices */}
+              <div className="mt-2">
+                <label className="text-xs mb-1 block" style={{color:'var(--text-tertiary)'}}>
+                  embedding_dim — valeurs candidate
+                </label>
+                <div className="flex gap-1.5 flex-wrap">
+                  {[2, 4, 8, 16, 32, 64].map(v => {
+                    const active = embSearch.includes(v);
+                    return (
+                      <button key={v} type="button"
+                        onClick={() => setEmbSearch(prev =>
+                          prev.includes(v) ? prev.filter(x => x !== v) : [...prev, v].sort((a,b)=>a-b)
+                        )}
+                        className="px-2 py-1 rounded text-xs font-mono border"
+                        style={{
+                          background:  active ? 'var(--accent-purple)' : 'var(--bg-elevated)',
+                          borderColor: active ? 'var(--accent-purple)' : 'var(--border-default)',
+                          color:       active ? 'var(--bg-elevated)' : 'var(--text-tertiary)',
+                        }}>
+                        {active && '✓ '}{v}
+                      </button>
+                    );
+                  })}
+                </div>
+              </div>
+
+              {/* Learning rates choices */}
+              <div className="mt-2">
+                <label className="text-xs mb-1 block" style={{color:'var(--text-tertiary)'}}>
+                  learning_rate — valeurs candidate
+                </label>
+                <div className="flex gap-1.5 flex-wrap">
+                  {[1e-4, 5e-4, 1e-3, 2e-3, 5e-3, 1e-2].map(v => {
+                    const active = lrChoices.includes(v);
+                    return (
+                      <button key={v} type="button"
+                        onClick={() => setLrChoices(prev =>
+                          prev.includes(v) ? prev.filter(x => x !== v) : [...prev, v].sort((a,b)=>a-b)
+                        )}
+                        className="px-2 py-1 rounded text-xs font-mono border"
+                        style={{
+                          background:  active ? 'var(--accent-orange)' : 'var(--bg-elevated)',
+                          borderColor: active ? 'var(--accent-orange)' : 'var(--border-default)',
+                          color:       active ? 'var(--bg-elevated)' : 'var(--text-tertiary)',
+                        }}>
+                        {active && '✓ '}{v}
+                      </button>
+                    );
+                  })}
+                </div>
+              </div>
             </>
           )}
         </div>
 
-        {/* Mode AutoML : message d'info */}
+        {/* Mode AutoML : message d'info — total époques de recherche */}
         {mode === 'auto' && trainingStatus === 'idle' && (
           <div className="rounded-xl border p-4"
-            style={{ background:'var(--bg-base)', borderColor:'#81c78440' }}>
+            style={{ background:'var(--bg-base)', borderColor:'var(--accent-green)' }}>
             <div className="flex items-start gap-2">
               <BrainCircuit size={18} style={{ color:'var(--accent-green)', flexShrink:0, marginTop:2 }}/>
               <div>
                 <p className="text-sm font-semibold" style={{ color:'var(--accent-green)' }}>
-                  Mode AutoML — Recherche automatique
+                  Mode AutoML — Recherche bayésienne
                 </p>
                 <p className="text-xs mt-1" style={{ color:'var(--text-tertiary)' }}>
-                  L'architecture sera trouvée par optimisation bayésienne.<br/>
-                  <b>{maxTrials} essais</b> × <b>{cvFolds} plis CV</b> × <b>{trialEp} époques</b><br/>
-                  = <b style={{color:'var(--accent-green)'}}>{maxTrials * cvFolds * trialEp} époques</b> de recherche.
+                  <b>Phase 1 — Optimisation Bayésienne (GP)</b> : {maxTrials} essais × CV {cvFolds} folds × max {trialEp} ep/fold
+                  = <span style={{color:'var(--accent-green)'}}>jusqu'à {maxTrials * cvFolds * trialEp} époques</span> d'exploration<br/>
+                  <b>Phase 2 — Entraînement final</b> : best model entraîné sur
+                  <span style={{color:'var(--accent-orange)'}}> {finalEp} époques</span> (notebook PFE : EPOCHS_FIN=35)<br/>
+                  EarlyStopping patience=6 + ReduceLROnPlateau · patience CV : <b>{patience}</b> ·
+                  Logs LIVE à chaque essai dans la zone monitoring.
                 </p>
               </div>
             </div>
@@ -1097,7 +1026,8 @@ export default function TrainingPanel() {
             dropouts={dropouts}
             batchSize={batchSize}
             lookback={lookback}
-            machineId={machineId}
+            embeddingDim={embeddingDim}
+            numClassesComp={numClassesComp}
           />
         )}
 
@@ -1120,17 +1050,17 @@ export default function TrainingPanel() {
           </span>
         </div>
 
-        {/* Métriques finales */}
+        {/* Métriques finales — en JOURS pour Cevital */}
         {result && (
           <div className="grid grid-cols-4 gap-3">
-            <Stat label="R² Score"     value={result.r2?.toFixed(4)||predictions?.r2_score?.toFixed(4)}  color="var(--success)"  sub="Coefficient de détermination" />
-            <Stat label="MAE normalisé" value={result.mae?.toFixed(5)}                                    color="var(--accent-blue)"  sub="Sur données [0,1]" />
-            <Stat label="MAE réel (h)" value={`${(result.mae_hours||predictions?.mae_hours)?.toFixed(1)}h`} color="var(--accent-orange)" sub="Après dénormalisation" />
-            <Stat label="Durée"        value={result.duration?`${Math.round(result.duration)}s`:'—'}      color="var(--accent-purple)"  sub="Temps d'entraînement" />
+            <Stat label="R² Score"  value={result.r2?.toFixed(4) || predictions?.r2_score?.toFixed(4)}  color="var(--success)"        sub="Coefficient de détermination" />
+            <Stat label="MAE (j)"   value={result.mae != null ? `${result.mae.toFixed(2)} j` : '—'}       color="var(--accent-blue)"    sub="Mean Abs. Error en jours" />
+            <Stat label="RMSE (j)"  value={result.rmse != null ? `${result.rmse.toFixed(2)} j` : '—'}     color="var(--accent-orange)"  sub="Root MSE en jours" />
+            <Stat label="Durée"     value={result.duration ? `${Math.round(result.duration)}s` : '—'}    color="var(--accent-purple)"  sub="Temps d'entraînement" />
           </div>
         )}
 
-        {/* Barre Keras style — époque courante */}
+        {/* Barre Keras style — époque courante (manuel ET dans chaque trial AutoML) */}
         {trainingStatus==='running' && currentEpoch && (
           <KerasEpochBar epoch={currentEpoch} />
         )}
@@ -1211,6 +1141,180 @@ export default function TrainingPanel() {
           </>
         )}
       </div>
+    </div>
+  );
+}
+
+
+// ════════════════════════════════════════════════════════════════
+// Sous-composants Phase 3 — DATASET card + PARAMÈTRES MODÈLE card
+// ════════════════════════════════════════════════════════════════
+
+function DatasetCard({ datasets, currentDataset, currentDatasetId, onSelect }) {
+  const ds = currentDataset;
+  const preprocessed = ds?.status === 'preprocessed';
+  const eligible = datasets.filter(d => d.status === 'preprocessed' || d.id === currentDatasetId);
+
+  return (
+    <div className="rounded-xl border p-4 space-y-3"
+      style={{
+        background:  'var(--bg-card)',
+        borderColor: preprocessed ? 'var(--brand-primary)' : 'var(--border-default)',
+      }}>
+      <div className="flex items-center gap-2">
+        <Database size={14} style={{ color: 'var(--brand-primary)' }} />
+        <p className="text-xs font-semibold uppercase tracking-widest"
+           style={{ color: 'var(--text-tertiary)' }}>
+          Dataset
+        </p>
+      </div>
+
+      <select
+        value={currentDatasetId || ''}
+        onChange={(e) => onSelect(parseInt(e.target.value, 10))}
+        className="w-full px-3 py-2 rounded-lg text-sm font-mono border outline-none"
+        style={{
+          background:  'var(--bg-elevated)',
+          borderColor: 'var(--border-default)',
+          color:       'var(--text-primary)',
+        }}>
+        {datasets.length === 0 && <option value="">Aucun dataset</option>}
+        {!currentDatasetId && datasets.length > 0 && <option value="">— sélectionner —</option>}
+        {datasets.map(d => (
+          <option key={d.id} value={d.id}>
+            {d.name} · {d.status}
+          </option>
+        ))}
+      </select>
+
+      {ds && (
+        <>
+          <div className="space-y-0.5 text-xs font-mono"
+               style={{ color: 'var(--text-secondary)' }}>
+            {ds.n_rows > 0 && (
+              <div>📊 {ds.n_rows.toLocaleString()} lignes · {ds.n_composants} composants</div>
+            )}
+            {ds.n_failures > 0 && (
+              <div>💥 {ds.n_failures} pannes · 🔧 {ds.n_maintenances} maint.</div>
+            )}
+            {ds.period_start && (
+              <div>📅 {String(ds.period_start).slice(0,10)} → {String(ds.period_end).slice(0,10)}</div>
+            )}
+          </div>
+
+          {ds.preproc_config && (
+            <div className="rounded-lg p-2 border"
+              style={{
+                background:  'var(--bg-elevated)',
+                borderColor: 'var(--border-subtle)',
+              }}>
+              <p className="text-[10px] mb-1.5"
+                 style={{ color: 'var(--text-tertiary)' }}>
+                ⚙️ Config Prétraitement (lecture seule)
+              </p>
+              <div className="text-xs font-mono space-y-0.5"
+                   style={{ color: 'var(--text-secondary)' }}>
+                <div>• Lookback : <b>{ds.preproc_config.lookback} jours</b></div>
+                <div>• MAX RUL : <b>{ds.preproc_config.current_max_rul} jours</b></div>
+                <div>• Poids RUL faibles : <b>×{ds.preproc_config.weight_factor}</b></div>
+                <div>• Split temporel : <b>
+                  {Math.round((1 - (ds.preproc_config.val_ratio ?? 0.15) - (ds.preproc_config.test_ratio ?? 0.15)) * 100)}%
+                  {' '}/ {Math.round((ds.preproc_config.val_ratio ?? 0.15) * 100)}%
+                  {' '}/ {Math.round((ds.preproc_config.test_ratio ?? 0.15) * 100)}%
+                </b> <span style={{ color:'var(--text-muted)' }}>(train/val/test)</span></div>
+              </div>
+            </div>
+          )}
+
+          {!preprocessed && (
+            <div className="rounded-lg p-2.5 border flex items-start gap-2"
+              style={{
+                background:  'var(--tint-error-bg)',
+                borderColor: 'var(--accent-orange)',
+              }}>
+              <AlertTriangle size={14} style={{ color: 'var(--accent-orange)', flexShrink: 0 }}/>
+              <p className="text-xs leading-relaxed"
+                 style={{ color: 'var(--accent-orange)' }}>
+                Ce dataset n'a pas encore été <b>prétraité</b>. Va dans
+                <b> Préparation Données → Prétraitement</b> avant de lancer l'entraînement.
+              </p>
+            </div>
+          )}
+        </>
+      )}
+
+      {!ds && datasets.length === 0 && (
+        <div className="rounded-lg p-3 text-center border"
+          style={{
+            background:  'var(--bg-elevated)',
+            borderColor: 'var(--accent-orange)',
+          }}>
+          <p className="text-xs" style={{ color: 'var(--accent-orange)' }}>
+            ⚠️ Aucun dataset disponible
+          </p>
+          <p className="text-[10px] mt-1" style={{ color: 'var(--text-tertiary)' }}>
+            Crée-en un dans <b>Préparation Données</b>.
+          </p>
+        </div>
+      )}
+    </div>
+  );
+}
+
+
+function ModelParamsCard({ embeddingDim, setEmbeddingDim, mode }) {
+  return (
+    <div className="rounded-xl border p-4"
+      style={{
+        background:  'var(--bg-card)',
+        borderColor: 'var(--border-default)',
+      }}>
+      <div className="flex items-center gap-2 mb-3">
+        <Cpu size={14} style={{ color: 'var(--accent-purple)' }}/>
+        <p className="text-xs font-semibold uppercase tracking-widest"
+           style={{ color: 'var(--text-tertiary)' }}>
+          Paramètres Modèle
+        </p>
+      </div>
+
+      <label className="text-xs mb-1 block"
+             style={{ color: 'var(--text-secondary)' }}>
+        Embedding Composant
+        {mode === 'auto' && (
+          <span className="ml-2 text-[10px]"
+                style={{ color: 'var(--accent-orange)' }}>
+            (AutoML cherche aussi cette valeur)
+          </span>
+        )}
+      </label>
+
+      <div className="flex gap-2">
+        {[4, 8, 16, 32].map(val => {
+          const active = embeddingDim === val;
+          return (
+            <button key={val}
+              onClick={() => setEmbeddingDim(val)}
+              disabled={mode === 'auto'}
+              className="flex-1 py-1.5 rounded text-sm font-mono border transition-all"
+              style={{
+                background:  active ? 'color-mix(in srgb, var(--accent-purple) 22%, var(--bg-card))' : 'var(--bg-elevated)',
+                borderColor: active ? 'var(--accent-purple)' : 'var(--border-default)',
+                color:       active ? 'var(--accent-purple)' : 'var(--text-tertiary)',
+                cursor:      mode === 'auto' ? 'not-allowed' : 'pointer',
+                opacity:     mode === 'auto' ? 0.6 : 1,
+              }}>
+              {val}
+            </button>
+          );
+        })}
+      </div>
+
+      <p className="text-xs mt-3 leading-relaxed"
+         style={{ color: 'var(--text-muted)' }}>
+        💡 Chaque composant est transformé en vecteur de cette taille. Plus c'est grand,
+        plus le modèle peut "personnaliser" sa prédiction par composant. Combiné aux
+        9 features numériques via <code>Concatenate</code>.
+      </p>
     </div>
   );
 }
