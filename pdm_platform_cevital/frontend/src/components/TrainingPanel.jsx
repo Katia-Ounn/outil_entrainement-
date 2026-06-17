@@ -448,6 +448,8 @@ export default function TrainingPanel() {
   } = useApp();
 
   const [mode,         setMode]         = useState('manual');
+  const [trainScope,   setTrainScope]   = useState('normal');  // 'normal' (split) | 'full' (déploiement, 100% data)
+  const [sourceExpId,  setSourceExpId]  = useState(null);      // expérience source → meilleure époque
   const [arch,         setArch]         = useState('LSTM');
   const [expName,      setExpName]      = useState('Exp_LSTM_01');
   const [embeddingDim, setEmbeddingDim] = useState(8);
@@ -468,10 +470,12 @@ export default function TrainingPanel() {
   // n'importe quel dataset preprocessed (dataset B fusionné, par exemple).
   useEffect(() => {
     if (!pendingRetrain) return;
-    const { hyperparams: hp, architecture, mode: m, name } = pendingRetrain;
+    const { hyperparams: hp, architecture, mode: m, name, source_experiment_id } = pendingRetrain;
     // ⚠️ dataset_id intentionnellement IGNORÉ — voir commentaire ci-dessus
     if (architecture) setArch(architecture);
-    if (m) setMode(m);
+    if (m === 'manual' || m === 'auto') setMode(m);   // 'full' n'est pas un mode du toggle
+    if (m === 'full') setTrainScope('full');           // réentraîner un modèle déployé → "toutes les données"
+    if (source_experiment_id != null) setSourceExpId(source_experiment_id);
     if (name) setExpName(name);
     if (hp) {
       if (hp.embedding_dim != null) setEmbeddingDim(hp.embedding_dim);
@@ -627,12 +631,30 @@ export default function TrainingPanel() {
     resetState();
     setTrainingStatus('running');
     setStartTime(Date.now());
-    addLog(mode === 'auto'
+    addLog(trainScope === 'full'
+      ? `🚀 Réentraînement sur TOUTES les données (déploiement)…`
+      : mode === 'auto'
       ? `🚀 Lancement AutoML Bayésien (${maxTrials} essais × CV 3 folds × ${trialEp} ep/fold — puis re-train ${finalEp} ep)…`
       : `🚀 Lancement entraînement Manuel (${epochs} époques)…`
     );
-    const url = mode==='manual' ? `${API}/api/train/manual` : `${API}/api/train/auto`;
-    const payload = mode==='manual'
+    const url = trainScope === 'full'
+      ? `${API}/api/train/full`
+      : mode==='manual' ? `${API}/api/train/manual` : `${API}/api/train/auto`;
+    const payload = trainScope === 'full'
+      ? {
+          dataset_id:    currentDatasetId,
+          name:          expName,
+          architecture:  arch,
+          embedding_dim: embeddingDim,
+          num_layers:    numLayers,
+          units:         units.slice(0, numLayers),
+          dropout_rates: dropouts.slice(0, numLayers),
+          learning_rate: lr,
+          batch_size:    batchSize,
+          epochs,
+          source_experiment_id: sourceExpId,
+        }
+      : mode==='manual'
       ? {
           dataset_id:    currentDatasetId,
           name:          expName,
@@ -674,7 +696,7 @@ export default function TrainingPanel() {
       addLog(`❌ ${e.message}`);
       setTrainingStatus('error');
     }
-  }, [currentDatasetId, datasetReady, mode, arch, expName, embeddingDim,
+  }, [currentDatasetId, datasetReady, mode, trainScope, sourceExpId, arch, expName, embeddingDim,
       numLayers, units, dropouts, lr, epochs, batchSize, patience,
       maxTrials, trialEp]);
 
@@ -715,7 +737,36 @@ export default function TrainingPanel() {
           onSelect={selectDataset}
         />
 
-        {/* Mode */}
+        {/* 🆕 Type d'entraînement : Normal (split) vs Toutes les données (déploiement) */}
+        <div className="rounded-xl border p-4" style={{ background:'var(--bg-card)', borderColor:'var(--border-default)' }}>
+          <p className={lblCls} style={{ color:'var(--text-tertiary)' }}>Type d'entraînement</p>
+          <div className="flex gap-2">
+            {[
+              ['normal', '🎯 Normal',             'Split train/val/test — pour évaluer le modèle'],
+              ['full',   '📦 Toutes les données', 'Réentraîne sur 100% des données — pour le déploiement'],
+            ].map(([s, label, hint]) => (
+              <button key={s}
+                onClick={() => { setTrainScope(s); setSourceExpId(null); if (s === 'full') setMode('manual'); }}
+                title={hint}
+                className="flex-1 py-2 rounded-lg text-sm font-semibold border transition-all"
+                style={{
+                  background:  trainScope===s ? 'var(--tint-warning-bg, var(--bg-elevated))' : 'var(--bg-elevated)',
+                  borderColor: trainScope===s ? 'var(--accent-amber, var(--accent-blue))'     : 'var(--border-default)',
+                  color:       trainScope===s ? 'var(--accent-amber, var(--accent-blue))'     : 'var(--text-muted)',
+                }}>
+                {label}
+              </button>
+            ))}
+          </div>
+          {trainScope === 'full' && (
+            <p className="text-xs mt-2" style={{ color:'var(--text-tertiary)' }}>
+              Hyperparamètres fixes (ceux du modèle). Époques = meilleure époque de l'entraînement normal. Pas d'AutoML ici.
+            </p>
+          )}
+        </div>
+
+        {/* Mode (seulement en entraînement normal) */}
+        {trainScope === 'normal' && (
         <div className="rounded-xl border p-4" style={{ background:'var(--bg-card)', borderColor:'var(--border-default)' }}>
           <p className={lblCls} style={{ color:'var(--text-tertiary)' }}>Mode</p>
           <div className="flex gap-2">
@@ -732,6 +783,7 @@ export default function TrainingPanel() {
             ))}
           </div>
         </div>
+        )}
 
         {/* Architecture — LSTM/GRU enabled, RNN/Transformer grisés */}
         <div className="rounded-xl border p-4" style={{ background:'var(--bg-card)', borderColor:'var(--border-default)' }}>
@@ -1002,7 +1054,7 @@ export default function TrainingPanel() {
           }}>
           {trainingStatus==='running'
             ? <><Loader size={16} className="animate-spin"/> Entraînement en cours...</>
-            : <><Play size={16}/> Lancer {arch}</>
+            : <><Play size={16}/> {trainScope === 'full' ? `Déployer ${arch} (toutes les données)` : `Lancer ${arch}`}</>
           }
         </button>
 

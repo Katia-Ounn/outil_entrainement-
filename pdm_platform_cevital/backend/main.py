@@ -1149,6 +1149,27 @@ class TrainAutoRequest(BaseModel):
     notes:         Optional[str] = None
 
 
+class TrainFullRequest(BaseModel):
+    """Réentraînement de DÉPLOIEMENT sur 100 % des données (train+val+test).
+
+    Mêmes hyperparamètres qu'en manuel (fixes). Le nombre d'époques utilisé est
+    la *meilleure époque* de l'expérience source (val_loss minimal) si
+    `source_experiment_id` est fourni ; sinon on retombe sur `epochs`.
+    """
+    dataset_id:    int
+    name:          str
+    architecture:  str       = Field("LSTM", pattern="^(LSTM|GRU)$")
+    embedding_dim: int       = Field(8, ge=2, le=64)
+    num_layers:    int       = Field(2, ge=1, le=3)
+    units:         List[int] = Field([64, 32])
+    dropout_rates: List[float] = Field([0.2, 0.15])
+    learning_rate: float     = Field(0.001, gt=0.0, le=0.1)
+    batch_size:    int       = Field(32, ge=8, le=512)
+    epochs:        int       = Field(50, ge=1, le=500, description="Fallback si pas d'historique source")
+    source_experiment_id: Optional[int] = Field(None, description="Expérience d'où récupérer la meilleure époque")
+    notes:         Optional[str] = None
+
+
 def _save_metadata_json(model_dir: Path, exp: Experiment,
                          pipeline: CevitalPipeline, architecture: str):
     """
@@ -1242,21 +1263,27 @@ def _save_model_artifacts(exp_id: int, pipeline: CevitalPipeline,
     with open(model_dir / "comp_mapping.json", "w", encoding="utf-8") as f:
         json.dump(comp_mapping_flat, f, indent=2, ensure_ascii=False)
 
-    # 5. Predictions test set
+    # 5. Predictions
     y_true = np.array(training_result["y_true"])
     y_pred = np.array(training_result["y_pred"])
     n = min(len(y_true), len(y_pred))
     df_test = pipeline.get_test_dataframe()
     if df_test is not None:
         lb = pipeline.lookback
-        date_col = df_test["date"].iloc[lb:].values[:n]
-        comp_col = df_test[pipeline.COMP_COL].iloc[lb:].values[:n]
+        date_col = list(df_test["date"].iloc[lb:].values[:n])
+        comp_col = list(df_test[pipeline.COMP_COL].iloc[lb:].values[:n])
     else:
-        date_col = [""] * n
-        comp_col = [""] * n
+        date_col = []
+        comp_col = []
+    # Aligner date/comp sur la longueur des prédictions : en mode "full"
+    # (déploiement) y_true/y_pred couvrent train+val+test → plus de lignes que le
+    # seul jeu de test. On complète par "" pour éviter le mismatch de longueurs
+    # (pandas exige des colonnes de même taille). Inchangé pour manuel/auto.
+    date_col = (date_col + [""] * n)[:n]
+    comp_col = (comp_col + [""] * n)[:n]
     df_preds = pd.DataFrame({
-        "date":   date_col[:n],
-        "comp":   comp_col[:n],
+        "date":   date_col,
+        "comp":   comp_col,
         "y_true": y_true[:n],
         "y_pred": y_pred[:n],
         "error":  np.abs(y_true[:n] - y_pred[:n]),
@@ -1443,6 +1470,106 @@ async def _run_training_auto(exp_id: int, req: TrainAutoRequest):
         db.close()
 
 
+async def _run_training_full(exp_id: int, req: TrainFullRequest):
+    """Task background : réentraînement DÉPLOIEMENT sur 100 % des données."""
+    print(f"\n[FULL] Task démarré pour exp_id={exp_id}", flush=True)
+    from full_trainer import CevitalFullTrainer
+    db = next(get_db())
+    try:
+        exp = db.query(Experiment).filter(Experiment.id == exp_id).first()
+        ds  = db.query(Dataset).filter(Dataset.id == req.dataset_id).first()
+        exp.status = TrainingStatus.RUNNING
+        db.commit()
+
+        # Préparation pipeline dans un thread (la boucle reste libre → WS OK)
+        pipe = await asyncio.to_thread(_prepare_pipeline_sync, req.dataset_id)
+
+        async def send_fn(payload: dict):
+            await manager.send_training(exp_id, payload)
+
+        # ── Modèle source : meilleure époque (val_loss min) + métriques héritées ──
+        src = None
+        if req.source_experiment_id is not None:
+            src = db.query(Experiment).filter(
+                Experiment.id == req.source_experiment_id
+            ).first()
+        best_epochs = int(req.epochs)
+        if src is not None and src.training_history:
+            valid = [
+                (int(h.get("epoch", i + 1)), float(h["val_loss"]))
+                for i, h in enumerate(src.training_history)
+                if h.get("val_loss") not in (None, 0, 0.0)
+            ]
+            if valid:
+                best_epochs = min(valid, key=lambda t: t[1])[0]
+
+        await send_fn({
+            "type": "log",
+            "message": (f"Meilleure époque retenue : {best_epochs} "
+                        f"(depuis l'expérience #{req.source_experiment_id})")
+                       if req.source_experiment_id else
+                       f"Époques (fixe) : {best_epochs}",
+        })
+
+        print(f"[FULL] Pipeline OK — époques={best_epochs}, lancement train_full...", flush=True)
+        trainer = CevitalFullTrainer(pipe, str(EXPORTS_DIR), req.name, send_fn=send_fn)
+        result = await trainer.train_full(
+            architecture  = req.architecture,
+            embedding_dim = req.embedding_dim,
+            num_layers    = req.num_layers,
+            units         = req.units,
+            dropout_rates = req.dropout_rates,
+            learning_rate = req.learning_rate,
+            epochs        = best_epochs,
+            batch_size    = req.batch_size,
+        )
+
+        model_dir = _save_model_artifacts(exp_id, pipe, result["model"], result)
+        # Métriques : on HÉRITE celles du modèle source (estimation honnête sur le
+        # jeu de TEST). Les métriques d'ajustement (sur données vues à l'entraînement)
+        # seraient trompeuses → on ne les stocke pas. Sans source : pas de métriques
+        # (le modèle est sauvegardé quand même).
+        exp.status       = TrainingStatus.COMPLETED
+        exp.completed_at = datetime.utcnow()
+        exp.duration_sec = result["duration_sec"]
+        exp.r2        = src.r2        if src else None
+        exp.mae       = src.mae       if src else None
+        exp.rmse      = src.rmse      if src else None
+        exp.mape      = src.mape      if src else None
+        exp.accuracy  = src.accuracy  if src else None
+        exp.precision = src.precision if src else None
+        exp.recall    = src.recall    if src else None
+        exp.f1_score  = src.f1_score  if src else None
+        exp.training_history = result["training_history"]
+        exp.model_dir        = str(model_dir)
+        exp.hyperparams      = {
+            "lookback":         pipe.lookback,
+            "current_max_rul":  pipe.current_max_rul,
+            "embedding_dim":    req.embedding_dim,
+            "num_layers":       req.num_layers,
+            "units":            req.units,
+            "dropout_rates":    req.dropout_rates,
+            "learning_rate":    req.learning_rate,
+            "batch_size":       req.batch_size,
+            "epochs":           best_epochs,
+            "weight_factor":    (ds.preproc_config or {}).get("weight_factor", 15.0),
+            "feature_cols":     pipe.FEATURE_COLS,
+            "mode":             "full",
+            "trained_on":       "all_data",
+            "n_sequences":      result.get("n_sequences"),
+            "source_experiment_id": req.source_experiment_id,
+        }
+        _save_metadata_json(model_dir, exp, pipe, req.architecture)
+        db.commit()
+    except Exception as e:
+        traceback.print_exc()
+        exp.status        = TrainingStatus.FAILED
+        exp.error_message = str(e)
+        db.commit()
+    finally:
+        db.close()
+
+
 @app.post("/api/train/manual", status_code=202)
 async def train_manual(req: TrainManualRequest,
                         background_tasks: BackgroundTasks,
@@ -1466,6 +1593,142 @@ async def train_manual(req: TrainManualRequest,
 
     background_tasks.add_task(_run_training_manual, exp.id, req)
     return {"experiment_id": exp.id, "status": "started"}
+
+
+@app.post("/api/train/full", status_code=202)
+async def train_full_endpoint(req: TrainFullRequest,
+                              background_tasks: BackgroundTasks,
+                              db: Session = Depends(get_db)):
+    """Réentraînement de DÉPLOIEMENT sur 100 % des données. Retourne exp_id."""
+    ds = db.query(Dataset).filter(Dataset.id == req.dataset_id).first()
+    if not ds:
+        raise HTTPException(404, "Dataset introuvable")
+    if ds.status != DatasetStatus.PREPROCESSED:
+        raise HTTPException(400, "Lance d'abord le prétraitement (/preprocessing)")
+
+    exp = Experiment(
+        name=req.name,
+        architecture=req.architecture,
+        mode="full",
+        status=TrainingStatus.PENDING,
+        dataset_id=req.dataset_id,
+        notes=req.notes,
+    )
+    db.add(exp); db.commit(); db.refresh(exp)
+
+    background_tasks.add_task(_run_training_full, exp.id, req)
+    return {"experiment_id": exp.id, "status": "started"}
+
+
+_NEXT_FAIL_MODEL_CACHE: dict = {}   # exp_id -> modèle Keras chargé (évite de recharger à chaque appel)
+
+
+@app.get("/api/experiments/{exp_id}/next_failures")
+def get_next_failures(exp_id: int, db: Session = Depends(get_db)):
+    """Prédit la PROCHAINE panne de chaque composant avec le modèle entraîné.
+
+    Pour chaque composant : on prend sa fenêtre la plus récente (les `lookback`
+    derniers jours), le modèle prédit le RUL → prochaine panne = dernière date du
+    composant + RUL. Renvoie aussi les pannes passées (historique) pour la timeline.
+    Endpoint synchrone (def) → exécuté dans le threadpool FastAPI (calcul lourd).
+    """
+    exp = db.query(Experiment).filter(Experiment.id == exp_id).first()
+    if not exp:
+        raise HTTPException(404, "Experiment introuvable")
+    if not exp.model_dir:
+        raise HTTPException(400, "Modèle non entraîné")
+    model_path = Path(exp.model_dir) / "model.keras"
+    if not model_path.exists():
+        raise HTTPException(404, "model.keras introuvable")
+
+    try:
+        # Pipeline préparé (features + scalers + mapping composant) pour ce dataset.
+        # ⚠️ 1er appel après un redémarrage = cache froid → préparation longue.
+        print(f"[NEXTFAIL] exp={exp_id} — préparation pipeline (dataset {exp.dataset_id})...", flush=True)
+        pipe = _prepare_pipeline_sync(exp.dataset_id)
+        df = pipe.df_export
+        if df is None or len(df) == 0:
+            raise HTTPException(400, "Données du dataset indisponibles")
+
+        # Modèle mis en cache par expérience → évite ~1-3 s de rechargement à chaque appel
+        model = _NEXT_FAIL_MODEL_CACHE.get(exp_id)
+        if model is None:
+            print(f"[NEXTFAIL] exp={exp_id} — chargement modèle Keras (1ère fois)...", flush=True)
+            from tensorflow.keras.models import load_model
+            # compile=False : inférence seule → pas besoin de la loss custom
+            # (asymmetric_rul_loss) ni de l'optimiseur. Évite le TypeError au chargement.
+            model = load_model(str(model_path), compile=False)
+            _NEXT_FAIL_MODEL_CACHE[exp_id] = model
+        print(f"[NEXTFAIL] exp={exp_id} — pipeline+modèle OK ({len(df)} lignes), prédiction...", flush=True)
+
+        lookback     = int(pipe.lookback)
+        feature_cols = list(pipe.FEATURE_COLS)
+        scaler_x     = pipe.scaler_x
+        scaler_y     = pipe.scaler_y
+        max_rul      = int(pipe.current_max_rul)
+        comp_to_idx  = getattr(pipe, "_comp_name_to_idx", {}) or {}
+        COMP         = pipe.COMP_COL
+
+        df = df.sort_values([COMP, "date"])
+        windows_num, windows_cat, meta = [], [], []
+        skipped = 0
+        for comp, g in df.groupby(COMP, sort=False):
+            if len(g) < lookback:
+                skipped += 1
+                continue
+            last_rows = g.iloc[-lookback:]
+            Xn   = scaler_x.transform(last_rows[feature_cols].values).astype("float32")
+            cidx = int(comp_to_idx.get(str(comp), 0))
+            windows_num.append(Xn)
+            windows_cat.append(np.full((lookback,), cidx, dtype="int32"))
+            past_fail = (
+                g.loc[g["failure"] == 1, "date"].astype(str).str.slice(0, 10).tolist()
+                if "failure" in g.columns else []
+            )
+            meta.append({
+                "comp":          str(comp),
+                "last_date":     str(g["date"].iloc[-1])[:10],
+                "past_failures": past_fail,
+                "n_failures":    len(past_fail),
+            })
+
+        if not windows_num:
+            return {"components": [], "max_rul": max_rul, "skipped": skipped, "n": 0}
+
+        Xn_all = np.stack(windows_num)
+        Xc_all = np.stack(windows_cat)
+        preds  = model.predict([Xn_all, Xc_all], verbose=0).flatten()
+        ruls   = np.clip(
+            scaler_y.inverse_transform(preds.reshape(-1, 1)).flatten(), 0, max_rul
+        )
+
+        results = []
+        for mrow, rul in zip(meta, ruls):
+            rul_days  = int(round(float(rul)))
+            last_dt   = pd.to_datetime(mrow["last_date"])
+            next_fail = (last_dt + pd.Timedelta(days=rul_days)).strftime("%Y-%m-%d")
+            results.append({
+                "comp":                   mrow["comp"],
+                "last_date":              mrow["last_date"],
+                "predicted_rul":          rul_days,
+                "predicted_next_failure": next_fail,
+                "past_failures":          mrow["past_failures"],
+                "n_failures":             mrow["n_failures"],
+            })
+        results.sort(key=lambda r: r["predicted_rul"])   # plus urgent en premier
+        print(f"[NEXTFAIL] exp={exp_id} — terminé ({len(results)} composants)", flush=True)
+        return {
+            "components": results,
+            "max_rul":    max_rul,
+            "n":          len(results),
+            "skipped":    skipped,
+            "data_end":   str(df["date"].max())[:10],
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        traceback.print_exc()
+        raise HTTPException(500, f"Erreur prédiction prochaine panne : {type(e).__name__}: {e}")
 
 
 @app.post("/api/train/auto", status_code=202)
@@ -1701,7 +1964,8 @@ import pandas as pd
 from tensorflow.keras.models import load_model
 
 # ── 1. Charger les artefacts ──────────────────────────────
-model    = load_model("model.keras")
+# compile=False : pour prédire, pas besoin de la loss custom (asymmetric_rul_loss)
+model    = load_model("model.keras", compile=False)
 scaler_x = joblib.load("scaler_x.pkl")
 scaler_y = joblib.load("scaler_y.pkl")
 
