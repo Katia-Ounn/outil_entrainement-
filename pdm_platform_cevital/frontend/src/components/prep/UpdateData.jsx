@@ -7,8 +7,8 @@
  *   - Les données du dataset sont remplacées
  *   - Le pipeline est remis à zéro pour re-run
  */
-import { useState, useRef } from 'react';
-import { Upload, RefreshCw, CheckCircle2, AlertCircle, Calendar, Database, FileText, Loader } from 'lucide-react';
+import { useState, useRef, useEffect } from 'react';
+import { Upload, RefreshCw, RotateCcw, CheckCircle2, AlertCircle, Calendar, Database, FileText, Loader } from 'lucide-react';
 import toast from 'react-hot-toast';
 import { useApp } from '../../AppContext';
 
@@ -21,7 +21,40 @@ export default function UpdateData({ datasetId, currentDataset, onUpdated }) {
   const [result,    setResult]    = useState(null);
   const [error,     setError]     = useState(null);
   const [dragging,  setDragging]  = useState(false);
+  const [canUndo,   setCanUndo]   = useState(false);
+  const [undoInfo,  setUndoInfo]  = useState(null);
+  const [undoing,   setUndoing]   = useState(false);
   const inputRef = useRef();
+
+  // Vérifie au montage si le dernier ajout peut être annulé (backup présent côté serveur)
+  useEffect(() => {
+    if (!datasetId) { setCanUndo(false); return; }
+    let alive = true;
+    fetch(`${API}/api/datasets/${datasetId}/can_undo_update`)
+      .then(r => r.json())
+      .then(d => { if (alive) { setCanUndo(!!d.can_undo); setUndoInfo(d.info || null); } })
+      .catch(() => {});
+    return () => { alive = false; };
+  }, [datasetId]);
+
+  const handleUndo = async () => {
+    if (!datasetId) return;
+    if (!window.confirm("Annuler le dernier ajout ? Le failure.csv reviendra à l'état précédent.")) return;
+    setUndoing(true);
+    try {
+      const res  = await fetch(`${API}/api/datasets/${datasetId}/undo_update`, { method: 'POST' });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.detail || 'Erreur serveur');
+      setCanUndo(false); setUndoInfo(null); setResult(null);
+      resetPipelineResults();
+      toast.success(data.msg || 'Dernier ajout annulé');
+      if (onUpdated) onUpdated();
+    } catch (e) {
+      toast.error(`Erreur annulation : ${e.message}`);
+    } finally {
+      setUndoing(false);
+    }
+  };
 
   const handleFile = (f) => {
     if (!f) return;
@@ -58,6 +91,8 @@ export default function UpdateData({ datasetId, currentDataset, onUpdated }) {
       const data = await res.json();
       if (!res.ok) throw new Error(data.detail || 'Erreur serveur');
       setResult(data);
+      setCanUndo(true);
+      setUndoInfo({ n_added: data.n_new, n_before: data.n_existing, n_after: data.n_total, date_max: data.date_max });
       resetPipelineResults();
       toast.success('Données mises à jour — pipeline réinitialisé !');
       if (onUpdated) onUpdated();
@@ -174,6 +209,25 @@ export default function UpdateData({ datasetId, currentDataset, onUpdated }) {
           ? <><Loader size={16} className="animate-spin" /> Mise à jour en cours...</>
           : <><RefreshCw size={16} /> Mettre à jour les données</>}
       </button>
+
+      {/* ── Annuler le dernier ajout ── */}
+      {canUndo && (
+        <button
+          onClick={handleUndo}
+          disabled={undoing}
+          className="w-full py-2.5 rounded-xl font-semibold text-sm flex items-center justify-center gap-2 transition-all"
+          style={{
+            background: 'var(--bg-elevated)',
+            color:      'var(--accent-orange)',
+            border:     '1px solid var(--accent-orange)',
+            cursor:     undoing ? 'not-allowed' : 'pointer',
+          }}
+        >
+          {undoing
+            ? <><Loader size={16} className="animate-spin" /> Annulation...</>
+            : <><RotateCcw size={16} /> Annuler le dernier ajout{undoInfo?.n_added ? ` (+${undoInfo.n_added.toLocaleString()} lignes)` : ''}</>}
+        </button>
+      )}
 
 
       {/* ── Résultat ── */}

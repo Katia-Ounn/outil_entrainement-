@@ -529,6 +529,19 @@ async def update_dataset_data(
     else:
         date_min = date_max = None
 
+    # 🆕 Backup de l'état AVANT ajout → permet d'annuler le dernier ajout.
+    #    On copie le failure.csv ACTUEL (pas encore écrasé) vers failure_prev.csv.
+    import shutil
+    shutil.copy2(fail_path, folder / "failure_prev.csv")
+    (folder / "last_update.json").write_text(json.dumps({
+        "timestamp": datetime.utcnow().isoformat(),
+        "n_before":  n_existing,
+        "n_added":   int(len(df_to_add)),
+        "n_after":   int(len(df_combined)),
+        "date_min":  date_min,
+        "date_max":  date_max,
+    }, ensure_ascii=False), encoding="utf-8")
+
     # Sauvegarder failure.csv mis à jour
     df_combined.to_csv(fail_path, index=False)
 
@@ -557,6 +570,69 @@ async def update_dataset_data(
         "date_max":    date_max,
         "n_cols":    int(len(df_combined.columns)),
         "msg":       f"✅ Données mises à jour ({len(df_combined):,} lignes · {date_min} → {date_max})",
+    }
+
+
+@app.get("/api/datasets/{dataset_id}/can_undo_update")
+def can_undo_update(dataset_id: int):
+    """Indique si le DERNIER ajout de données peut être annulé (backup présent)."""
+    folder = DATASETS_DIR / str(dataset_id)
+    backup = folder / "failure_prev.csv"
+    if not backup.exists():
+        return {"can_undo": False}
+    info = {}
+    meta_f = folder / "last_update.json"
+    if meta_f.exists():
+        try:
+            info = json.loads(meta_f.read_text(encoding="utf-8"))
+        except Exception:
+            info = {}
+    return {"can_undo": True, "info": info}
+
+
+@app.post("/api/datasets/{dataset_id}/undo_update")
+def undo_update(dataset_id: int, db: Session = Depends(get_db)):
+    """Annule le DERNIER ajout : restaure le failure.csv d'avant l'ajout."""
+    ds = db.query(Dataset).filter(Dataset.id == dataset_id).first()
+    if not ds:
+        raise HTTPException(404, f"Dataset {dataset_id} introuvable")
+    folder    = DATASETS_DIR / str(dataset_id)
+    backup    = folder / "failure_prev.csv"
+    fail_path = folder / "failure.csv"
+    if not backup.exists():
+        raise HTTPException(400, "Aucun ajout à annuler (pas de sauvegarde).")
+
+    import shutil
+    shutil.copy2(backup, fail_path)                 # restaure l'état d'avant le dernier ajout
+    backup.unlink(missing_ok=True)
+    (folder / "last_update.json").unlink(missing_ok=True)
+
+    # Recalcule les infos du dataset depuis le failure.csv restauré
+    df = pd.read_csv(fail_path, encoding="utf-8-sig")
+    date_col = "WOWO_DECLARATION_DATE"
+    date_min = date_max = None
+    if date_col in df.columns:
+        d = pd.to_datetime(df[date_col], errors="coerce").dropna()
+        if len(d):
+            date_min = d.min().strftime("%Y-%m-%d")
+            date_max = d.max().strftime("%Y-%m-%d")
+
+    ds.failure_path = str(fail_path)
+    ds.n_rows       = int(len(df))
+    ds.period_start = date_min
+    ds.period_end   = date_max
+    ds.status       = DatasetStatus.UPLOADED
+    ds.v1_path      = None
+    db.add(ds); db.commit()
+
+    _invalidate_pipeline(dataset_id)
+
+    return {
+        "ok":       True,
+        "n_rows":   int(len(df)),
+        "date_min": date_min,
+        "date_max": date_max,
+        "msg":      f"↩️ Dernier ajout annulé — {len(df):,} lignes ({date_min} → {date_max})",
     }
 
 
